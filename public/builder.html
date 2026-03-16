@@ -1,0 +1,1219 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HalfBaked Builder</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { font-family: 'Segoe UI', system-ui, sans-serif; }
+        .brand-text { font-weight: 700; letter-spacing: -0.5px; }
+        .navbar { border-bottom: 1px solid #21262d; }
+
+        /* Pipeline indicator */
+        .pipeline-indicator { display: flex; align-items: center; gap: 0; flex-wrap: wrap; }
+        .pipeline-step {
+            font-size: 0.72rem; font-weight: 600; padding: 2px 8px;
+            border-radius: 0; background: #21262d; color: #8b949e;
+            white-space: nowrap;
+        }
+        .pipeline-step:first-child { border-radius: 4px 0 0 4px; }
+        .pipeline-step:last-child { border-radius: 0 4px 4px 0; }
+        .pipeline-step.step-done { background: #238636; color: #fff; }
+        .pipeline-step.step-active { background: #1f6feb; color: #fff; }
+        .pipeline-step.step-failed { background: #da3633; color: #fff; }
+
+        /* Build cards */
+        .build-card { cursor: pointer; transition: border-color 0.2s, box-shadow 0.2s; }
+        .build-card:hover { border-color: #58a6ff; box-shadow: 0 0 0 1px rgba(88,166,255,0.3); }
+
+        /* Subtask thread */
+        .subtask-card {
+            border-left: 3px solid #30363d; margin-bottom: 8px;
+            transition: border-color 0.2s;
+        }
+        .subtask-card.status-completed { border-left-color: #238636; }
+        .subtask-card.status-generating { border-left-color: #1f6feb; }
+        .subtask-card.status-blocked { border-left-color: #d29922; }
+        .subtask-card.status-failed { border-left-color: #da3633; }
+        .subtask-card.status-pending { border-left-color: #6e7681; }
+        .subtask-card.status-validating { border-left-color: #d29922; }
+
+        .thread-indent { margin-left: 24px; }
+        .thread-indent-2 { margin-left: 48px; }
+        .thread-indent-3 { margin-left: 72px; }
+        .thread-indent-4 { margin-left: 96px; }
+
+        /* Domain badges */
+        .badge-domain-backend { background-color: #6f42c1 !important; }
+        .badge-domain-frontend { background-color: #20c997 !important; color: #000 !important; }
+        .badge-domain-api { background-color: #fd7e14 !important; color: #000 !important; }
+        .badge-domain-shared { background-color: #6c757d !important; }
+        .badge-domain-database { background-color: #0dcaf0 !important; color: #000 !important; }
+        .badge-domain-testing { background-color: #ffc107 !important; color: #000 !important; }
+
+        /* Complexity badges */
+        .badge-complexity-small { background-color: #198754 !important; }
+        .badge-complexity-medium { background-color: #ffc107 !important; color: #000 !important; }
+        .badge-complexity-large { background-color: #dc3545 !important; }
+        .badge-complexity-xl { background-color: #212529 !important; border: 1px solid #495057; }
+
+        /* Code output */
+        .code-output {
+            font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+            font-size: 0.8rem;
+            background: #0d1117;
+            color: #c9d1d9;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 12px;
+            max-height: 400px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        /* Architecture context */
+        .arch-context {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 16px;
+            font-size: 0.88rem;
+        }
+        .arch-context pre {
+            background: #0d1117;
+            padding: 8px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            margin-bottom: 0;
+        }
+
+        /* Progress bar in detail view */
+        .progress-thin { height: 6px; }
+
+        /* Spinner for generating status */
+        .spin { animation: spin 1s linear infinite; display: inline-block; }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+        /* Empty state */
+        .empty-state { padding: 80px 20px; }
+
+        /* Dep indicator symbols */
+        .dep-ok { color: #238636; }
+        .dep-progress { color: #d29922; }
+        .dep-fail { color: #da3633; }
+        .dep-pending { color: #6e7681; }
+
+        /* Timestamp muted */
+        .ts-muted { font-size: 0.78rem; color: #8b949e; }
+
+        /* Detail header */
+        .detail-header { border-bottom: 1px solid #21262d; padding-bottom: 16px; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-sm">
+        <div class="container-fluid">
+            <a class="navbar-brand brand-text" href="#" onclick="showListView(); return false;">HalfBaked Builder</a>
+            <div class="navbar-nav ms-auto">
+                <a class="nav-link" href="/">Home</a>
+                <a class="nav-link" href="/distillery">Distillery</a>
+                <a class="nav-link active" href="#" onclick="showListView(); return false;">Builds</a>
+                <a class="nav-link" href="#" data-bs-toggle="modal" data-bs-target="#newBuildModal">New Build</a>
+                <a class="nav-link" href="#" data-bs-toggle="modal" data-bs-target="#settingsModal">Settings</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container mt-4" id="app">
+
+        <!-- VIEW: Build List -->
+        <div id="view-list">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+                <h4 class="mb-0">Feature Builds</h4>
+                <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#newBuildModal">+ New Build</button>
+            </div>
+            <div id="builds-container">
+                <div class="text-center text-muted py-4">Loading...</div>
+            </div>
+            <div id="empty-state" class="empty-state text-center d-none">
+                <p class="text-muted mb-3">No builds yet. Create one to decompose a feature into expert-driven subtasks.</p>
+                <button class="btn btn-outline-primary" data-bs-toggle="modal" data-bs-target="#newBuildModal">Create First Build</button>
+            </div>
+        </div>
+
+        <!-- VIEW: Build Detail -->
+        <div id="view-detail" class="d-none">
+            <div class="detail-header">
+                <div class="d-flex align-items-start justify-content-between">
+                    <div>
+                        <button class="btn btn-sm btn-outline-secondary me-2 mb-2" onclick="showListView();">&larr; Back</button>
+                        <h4 class="d-inline align-middle mb-0" id="detail-title">-</h4>
+                    </div>
+                    <div class="d-flex gap-2">
+                        <button class="btn btn-sm btn-success" id="btn-execute" onclick="executeBuild(currentBuildId);" style="display:none;">Execute Build</button>
+                        <button class="btn btn-sm btn-warning" id="btn-rebuild" onclick="rebuildBuild(currentBuildId);" style="display:none;">Rebuild</button>
+                        <button class="btn btn-sm btn-primary" id="btn-commit" style="display:none;" data-bs-toggle="modal" data-bs-target="#commitModal">Commit &amp; Push</button>
+                        <button class="btn btn-sm btn-outline-danger" id="btn-delete" onclick="confirmDeleteBuild(currentBuildId);">Delete</button>
+                    </div>
+                </div>
+                <div class="mt-2">
+                    <span class="text-muted small" id="detail-project-path"></span>
+                    <span class="text-muted small ms-3" id="detail-model"></span>
+                </div>
+                <div class="mt-2 d-flex align-items-center gap-3 flex-wrap">
+                    <span id="detail-status-badge"></span>
+                    <div id="detail-pipeline" class="pipeline-indicator"></div>
+                </div>
+                <div class="mt-2">
+                    <div class="d-flex align-items-center gap-2">
+                        <span class="small text-muted" id="detail-progress-text">0/0 subtasks</span>
+                        <div class="progress progress-thin flex-grow-1" style="max-width:300px;">
+                            <div class="progress-bar bg-success" id="detail-progress-bar" role="progressbar" style="width:0%"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="mt-1 ts-muted" id="detail-timestamps"></div>
+            </div>
+
+            <!-- Architecture Context -->
+            <div id="detail-arch-context" class="arch-context mb-3 d-none">
+                <strong class="d-block mb-2">Architecture Context</strong>
+                <div id="arch-context-body"></div>
+            </div>
+
+            <!-- Build Result Summary -->
+            <div id="build-result" class="d-none"></div>
+
+            <!-- Subtask Thread -->
+            <div id="subtask-thread"></div>
+        </div>
+    </div>
+
+    <!-- MODAL: New Build Wizard -->
+    <div class="modal fade" id="newBuildModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">New Feature Build</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="new-build-form" onsubmit="return false;">
+                        <div class="mb-3">
+                            <label class="form-label" for="build-task">Feature Description <span class="text-danger">*</span></label>
+                            <textarea class="form-control" id="build-task" rows="3" required
+                                      placeholder="Describe the feature you want to build, e.g. 'Add a product catalog with CRUD operations, search, and Bootstrap 5 card-based UI'"></textarea>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label" for="build-project-path">Project Path or Git URL <span class="text-danger">*</span></label>
+                            <input type="text" class="form-control" id="build-project-path" required
+                                   placeholder="/path/to/project or https://github.com/user/repo.git">
+                            <div class="form-text">Local directory or git repo URL. Git repos will be cloned automatically.</div>
+                        </div>
+
+                        <hr class="my-3">
+                        <h6 class="mb-3">Decomposer Configuration</h6>
+
+                        <div class="row g-3">
+                            <div class="col-md-6">
+                                <label class="form-label" for="build-decomposer">Decomposer Provider</label>
+                                <select class="form-select" id="build-decomposer" onchange="onDecomposerChange();">
+                                    <option value="anthropic">Anthropic (Claude)</option>
+                                    <option value="openai">OpenAI / Compatible</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label" for="build-decomposer-model">Decomposer Model</label>
+                                <input type="text" class="form-control" id="build-decomposer-model"
+                                       placeholder="claude-sonnet-4-20250514">
+                            </div>
+                        </div>
+
+                        <div class="row g-3 mt-1">
+                            <div class="col-md-6">
+                                <label class="form-label" for="build-api-key">API Key</label>
+                                <input type="password" class="form-control" id="build-api-key"
+                                       placeholder="sk-... or leave blank to use saved setting">
+                                <div class="form-text">Leave blank to use the key from Settings.</div>
+                            </div>
+                            <div class="col-md-6" id="api-base-group" style="display:none;">
+                                <label class="form-label" for="build-api-base">API Base URL</label>
+                                <input type="text" class="form-control" id="build-api-base"
+                                       placeholder="https://api.openai.com/v1">
+                            </div>
+                        </div>
+
+                        <div class="mb-3 mt-3">
+                            <label class="form-label" for="build-experts">Expert Models</label>
+                            <input type="text" class="form-control" id="build-experts"
+                                   placeholder="voidlux-coder,bootstrap (comma-separated)">
+                            <div class="form-text">Comma-separated list of expert model names (Ollama tags or identifiers).</div>
+                        </div>
+
+                        <div class="form-check mt-3">
+                            <input class="form-check-input" type="checkbox" id="build-dry-run">
+                            <label class="form-check-label" for="build-dry-run">
+                                Dry run (decompose only, don't generate code)
+                            </label>
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" id="btn-submit-build" onclick="submitNewBuild();">Build</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL: Settings -->
+    <div class="modal fade" id="settingsModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Builder Settings</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label" for="settings-decomposer">Default Decomposer</label>
+                        <select class="form-select" id="settings-decomposer">
+                            <option value="anthropic">Anthropic (Claude)</option>
+                            <option value="openai">OpenAI / Compatible</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label" for="settings-decomposer-model">Default Model</label>
+                        <input type="text" class="form-control" id="settings-decomposer-model"
+                               placeholder="claude-sonnet-4-20250514">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label" for="settings-api-key">API Key</label>
+                        <input type="password" class="form-control" id="settings-api-key"
+                               placeholder="sk-...">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label" for="settings-api-base">API Base URL (OpenAI-compatible only)</label>
+                        <input type="text" class="form-control" id="settings-api-base"
+                               placeholder="https://api.openai.com/v1">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label" for="settings-experts">Default Expert Models</label>
+                        <input type="text" class="form-control" id="settings-experts"
+                               placeholder="voidlux-coder,bootstrap">
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" onclick="saveSettings();">Save Settings</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL: Delete confirmation -->
+    <div class="modal fade" id="deleteModal" tabindex="-1">
+        <div class="modal-dialog modal-sm">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h6 class="modal-title">Delete Build?</h6>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="mb-0">This will permanently delete the build and all subtask data.</p>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-danger btn-sm" id="btn-confirm-delete">Delete</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Commit Modal -->
+    <div class="modal fade" id="commitModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h6 class="modal-title">Commit &amp; Push Changes</h6>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label small">Branch Name</label>
+                        <input type="text" class="form-control form-control-sm" id="commit-branch" placeholder="build/xxxxxxxx">
+                        <small class="form-text text-muted">Leave blank for auto-generated name</small>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label small">Commit Message</label>
+                        <input type="text" class="form-control form-control-sm" id="commit-message" placeholder="feat: ...">
+                        <small class="form-text text-muted">Leave blank for auto-generated message from task description</small>
+                    </div>
+                    <div class="form-check mb-2">
+                        <input class="form-check-input" type="checkbox" id="commit-push" checked>
+                        <label class="form-check-label small" for="commit-push">Push to remote origin</label>
+                    </div>
+                    <div id="commit-result" class="d-none mt-3"></div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary btn-sm" id="btn-do-commit" onclick="doCommit();">Commit</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+    // =====================================================================
+    // State
+    // =====================================================================
+    let currentBuildId = null;
+    let pollInterval = null;
+    let lastPollJson = null;
+
+    const PIPELINE_STEPS = ['scanning', 'decomposing', 'generating', 'validating', 'assembling', 'done'];
+    const PIPELINE_LABELS = {
+        scanning: 'Scan',
+        decomposing: 'Decompose',
+        generating: 'Generate',
+        validating: 'Validate',
+        assembling: 'Assemble',
+        done: 'Done'
+    };
+
+    const STATUS_CLASSES = {
+        scanning: 'bg-info',
+        decomposing: 'bg-info',
+        generating: 'bg-primary',
+        validating: 'bg-warning text-dark',
+        assembling: 'bg-secondary',
+        done: 'bg-success',
+        failed: 'bg-danger',
+        pending: 'bg-secondary',
+        blocked: 'bg-warning text-dark',
+        completed: 'bg-success'
+    };
+
+    // =====================================================================
+    // Settings (localStorage)
+    // =====================================================================
+    function loadSettings() {
+        const s = JSON.parse(localStorage.getItem('halfbaked_builder_settings') || '{}');
+        $('#settings-decomposer').val(s.decomposer || 'anthropic');
+        $('#settings-decomposer-model').val(s.decomposer_model || '');
+        $('#settings-api-key').val(s.api_key || '');
+        $('#settings-api-base').val(s.api_base || '');
+        $('#settings-experts').val(s.experts || '');
+        return s;
+    }
+
+    function getSettings() {
+        return JSON.parse(localStorage.getItem('halfbaked_builder_settings') || '{}');
+    }
+
+    function saveSettings() {
+        const s = {
+            decomposer: $('#settings-decomposer').val(),
+            decomposer_model: $('#settings-decomposer-model').val(),
+            api_key: $('#settings-api-key').val(),
+            api_base: $('#settings-api-base').val(),
+            experts: $('#settings-experts').val()
+        };
+        localStorage.setItem('halfbaked_builder_settings', JSON.stringify(s));
+        bootstrap.Modal.getInstance(document.getElementById('settingsModal')).hide();
+    }
+
+    // =====================================================================
+    // View switching
+    // =====================================================================
+    function showListView() {
+        stopPolling();
+        currentBuildId = null;
+        $('#view-list').removeClass('d-none');
+        $('#view-detail').addClass('d-none');
+        loadBuilds();
+        window.history.pushState({}, '', window.location.pathname);
+    }
+
+    function showDetailView(id) {
+        currentBuildId = id;
+        $('#view-list').addClass('d-none');
+        $('#view-detail').removeClass('d-none');
+        viewBuild(id);
+        window.history.pushState({}, '', window.location.pathname + '?build=' + id);
+    }
+
+    // =====================================================================
+    // API: Load builds list
+    // =====================================================================
+    function loadBuilds() {
+        $.getJSON('/api/builds')
+            .done(function(data) {
+                const builds = Array.isArray(data) ? data : (data.builds || []);
+                if (builds.length === 0) {
+                    $('#builds-container').empty();
+                    $('#empty-state').removeClass('d-none');
+                } else {
+                    $('#empty-state').addClass('d-none');
+                    renderBuildList(builds);
+                }
+            })
+            .fail(function(xhr) {
+                $('#builds-container').html(
+                    '<div class="alert alert-danger">Failed to load builds: ' + (xhr.responseJSON?.error || xhr.statusText) + '</div>'
+                );
+            });
+    }
+
+    // =====================================================================
+    // API: View single build
+    // =====================================================================
+    function viewBuild(id) {
+        $.getJSON('/api/builds/' + id)
+            .done(function(data) {
+                renderBuildDetail(data);
+                startPolling(id);
+            })
+            .fail(function(xhr) {
+                $('#subtask-thread').html(
+                    '<div class="alert alert-danger">Failed to load build: ' + (xhr.responseJSON?.error || xhr.statusText) + '</div>'
+                );
+            });
+    }
+
+    // =====================================================================
+    // API: Create build
+    // =====================================================================
+    function createBuild(payload) {
+        $('#btn-submit-build').prop('disabled', true).text('Creating...');
+        $.ajax({
+            url: '/api/builds',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify(payload)
+        })
+        .done(function(data) {
+            bootstrap.Modal.getInstance(document.getElementById('newBuildModal')).hide();
+            $('#new-build-form')[0].reset();
+            const buildId = data.id || data.build_id || data.build?.id;
+            if (buildId) {
+                // Auto-execute the pipeline
+                $.ajax({
+                    url: '/api/builds/' + buildId + '/execute',
+                    method: 'POST'
+                });
+                showDetailView(buildId);
+            } else {
+                showListView();
+            }
+        })
+        .fail(function(xhr) {
+            alert('Failed to create build: ' + (xhr.responseJSON?.error || xhr.statusText));
+        })
+        .always(function() {
+            $('#btn-submit-build').prop('disabled', false).text('Build');
+        });
+    }
+
+    // =====================================================================
+    // API: Delete build
+    // =====================================================================
+    function deleteBuild(id) {
+        $.ajax({
+            url: '/api/builds/' + id,
+            method: 'DELETE'
+        })
+        .done(function() {
+            bootstrap.Modal.getInstance(document.getElementById('deleteModal')).hide();
+            showListView();
+        })
+        .fail(function(xhr) {
+            alert('Failed to delete build: ' + (xhr.responseJSON?.error || xhr.statusText));
+        });
+    }
+
+    // =====================================================================
+    // API: Execute build
+    // =====================================================================
+    function executeBuild(id) {
+        $('#btn-execute').prop('disabled', true).text('Starting...');
+        $.ajax({
+            url: '/api/builds/' + id + '/execute',
+            method: 'POST'
+        })
+        .done(function() {
+            $('#btn-execute').hide();
+            // Force re-render on next poll by clearing cache
+            lastPollJson = null;
+            viewBuild(id);
+        })
+        .fail(function(xhr) {
+            alert('Failed to execute build: ' + (xhr.responseJSON?.error || xhr.statusText));
+            $('#btn-execute').prop('disabled', false).text('Execute Build');
+        });
+    }
+
+    function rebuildBuild(id) {
+        if (!confirm('Reset all failed subtasks and re-run the build?')) return;
+        $('#btn-rebuild').prop('disabled', true).text('Rebuilding...');
+        $.ajax({
+            url: '/api/builds/' + id + '/rebuild',
+            method: 'POST'
+        })
+        .done(function(resp) {
+            $('#btn-rebuild').hide();
+            lastPollJson = null;
+            viewBuild(id);
+        })
+        .fail(function(xhr) {
+            alert('Failed to rebuild: ' + (xhr.responseJSON?.error || xhr.statusText));
+            $('#btn-rebuild').prop('disabled', false).text('Rebuild');
+        });
+    }
+
+    function doCommit() {
+        const branch = $('#commit-branch').val().trim();
+        const message = $('#commit-message').val().trim();
+        const push = $('#commit-push').is(':checked');
+
+        $('#btn-do-commit').prop('disabled', true).text('Committing...');
+        $('#commit-result').addClass('d-none');
+
+        $.ajax({
+            url: '/api/builds/' + currentBuildId + '/commit',
+            method: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({
+                branch: branch || undefined,
+                message: message || undefined,
+                push: push
+            })
+        })
+        .done(function(data) {
+            let html = '';
+            if (data.status === 'committed') {
+                html = '<div class="alert alert-success py-2 mb-0 small">';
+                html += '<strong>Committed to branch:</strong> <code>' + esc(data.branch) + '</code>';
+                if (data.pushed) {
+                    html += '<br><strong>Pushed to origin</strong>';
+                }
+                if (data.pr_url) {
+                    html += '<br><a href="' + esc(data.pr_url) + '" target="_blank" class="btn btn-sm btn-success mt-2">Create Pull Request &rarr;</a>';
+                }
+                if (data.diff_stat) {
+                    html += '<pre class="mt-2 mb-0 small" style="color:#8b949e;">' + esc(data.diff_stat) + '</pre>';
+                }
+                html += '</div>';
+                // Update button state
+                $('#btn-commit').removeClass('btn-primary').addClass('btn-outline-success').html('&#10003; Committed');
+                lastPollJson = null; // Force re-render
+            } else if (data.status === 'nothing_to_commit') {
+                html = '<div class="alert alert-warning py-2 mb-0 small">Nothing to commit — no changes detected on branch <code>' + esc(data.branch) + '</code></div>';
+            }
+            $('#commit-result').html(html).removeClass('d-none');
+            $('#btn-do-commit').prop('disabled', false).text('Commit');
+        })
+        .fail(function(xhr) {
+            const err = xhr.responseJSON?.error || xhr.statusText;
+            const details = xhr.responseJSON?.details ? JSON.stringify(xhr.responseJSON.details, null, 2) : '';
+            let html = '<div class="alert alert-danger py-2 mb-0 small">' + esc(err);
+            if (details) html += '<pre class="mt-1 mb-0 small">' + esc(details) + '</pre>';
+            html += '</div>';
+            $('#commit-result').html(html).removeClass('d-none');
+            $('#btn-do-commit').prop('disabled', false).text('Commit');
+        });
+    }
+
+    // =====================================================================
+    // Render: Build list
+    // =====================================================================
+    function renderBuildList(builds) {
+        let html = '<div class="row g-3">';
+        builds.forEach(function(b) {
+            const statusCls = STATUS_CLASSES[b.status] || 'bg-secondary';
+            const subtasks = b.subtasks || [];
+            const completed = subtasks.filter(t => t.status === 'completed').length;
+            const total = subtasks.length;
+            const pctComplete = total > 0 ? Math.round((completed / total) * 100) : 0;
+            const createdAt = b.created_at ? formatTs(b.created_at) : '';
+            const updatedAt = b.updated_at ? formatTs(b.updated_at) : '';
+
+            html += `
+            <div class="col-12">
+                <div class="card build-card" onclick="showDetailView('${esc(b.id)}');">
+                    <div class="card-body py-3">
+                        <div class="d-flex justify-content-between align-items-start">
+                            <div class="flex-grow-1">
+                                <h6 class="mb-1">${esc(truncate(b.task || b.description || 'Untitled', 120))}</h6>
+                                <div class="small text-muted mb-2">${esc(b.project_path || '')}</div>
+                            </div>
+                            <span class="badge ${statusCls} ms-2">${esc(b.status || 'unknown')}</span>
+                        </div>
+                        <div class="d-flex align-items-center gap-3 flex-wrap">
+                            <div class="pipeline-indicator">
+                                ${renderPipelineIndicator(b.status)}
+                            </div>
+                            <span class="small text-muted">${total > 0 ? completed + '/' + total + ' subtasks' : 'No subtasks yet'}</span>
+                            ${total > 0 ? `
+                            <div class="progress progress-thin" style="width:120px;height:4px;">
+                                <div class="progress-bar bg-success" style="width:${pctComplete}%"></div>
+                            </div>` : ''}
+                        </div>
+                        ${createdAt ? `<div class="ts-muted mt-1">Created ${createdAt}${updatedAt && updatedAt !== createdAt ? ' &middot; Updated ' + updatedAt : ''}</div>` : ''}
+                    </div>
+                </div>
+            </div>`;
+        });
+        html += '</div>';
+        $('#builds-container').html(html);
+    }
+
+    // =====================================================================
+    // Render: Pipeline indicator
+    // =====================================================================
+    function renderPipelineIndicator(status) {
+        if (!status) return '';
+        const failedStatuses = ['failed'];
+        const isFailed = failedStatuses.includes(status);
+        const currentIdx = PIPELINE_STEPS.indexOf(status);
+
+        return PIPELINE_STEPS.map(function(step, idx) {
+            let cls = 'pipeline-step';
+            if (isFailed) {
+                // Show which step failed - highlight all before as done, the failed step as failed
+                if (idx < currentIdx || currentIdx === -1) cls += ' step-done';
+                else if (idx === currentIdx) cls += ' step-failed';
+            } else if (status === 'done') {
+                cls += ' step-done';
+            } else {
+                if (currentIdx >= 0 && idx < currentIdx) cls += ' step-done';
+                else if (idx === currentIdx) cls += ' step-active';
+            }
+            return `<span class="${cls}">${PIPELINE_LABELS[step]}</span>`;
+        }).join('');
+    }
+
+    // =====================================================================
+    // Render: Build detail
+    // =====================================================================
+    function renderBuildDetail(data) {
+        // API returns { build: {...}, subtasks: [...] }
+        const build = data.build || data;
+        const subtasks = data.subtasks || build.subtasks || [];
+        const completed = subtasks.filter(t => t.status === 'completed').length;
+        const total = subtasks.length;
+        const pctComplete = total > 0 ? Math.round((completed / total) * 100) : 0;
+
+        $('#detail-title').text(truncate(build.task || build.description || 'Untitled', 200));
+
+        // Show project path / git URL prominently
+        const projectPath = build.project_path || '';
+        const gitUrl = build.config?.git_url || '';
+        const isGit = /^(https?:\/\/|git@|ssh:\/\/)/.test(projectPath);
+        let pathHtml = '';
+        if (isGit || gitUrl) {
+            const displayUrl = gitUrl || projectPath;
+            pathHtml = '<span class="badge bg-dark border me-2">git</span>' + esc(displayUrl);
+            if (build.config?.clone_path) {
+                pathHtml += ' <span class="text-muted small">&rarr; ' + esc(build.config.clone_path) + '</span>';
+            }
+        } else if (projectPath) {
+            pathHtml = '<span class="badge bg-dark border me-2">local</span>' + esc(projectPath);
+        }
+        $('#detail-project-path').html(pathHtml);
+        $('#detail-model').text(build.config?.decomposer_model ? 'Model: ' + build.config.decomposer_model : '');
+
+        const statusCls = STATUS_CLASSES[build.status] || 'bg-secondary';
+        $('#detail-status-badge').html(`<span class="badge ${statusCls}">${esc(build.status || 'unknown')}</span>`);
+        $('#detail-pipeline').html(renderPipelineIndicator(build.status));
+
+        $('#detail-progress-text').text(completed + '/' + total + ' subtasks');
+        $('#detail-progress-bar').css('width', pctComplete + '%');
+
+        // Timestamps
+        const parts = [];
+        if (build.created_at) parts.push('Created ' + formatTs(build.created_at));
+        if (build.updated_at) parts.push('Updated ' + formatTs(build.updated_at));
+        $('#detail-timestamps').text(parts.join(' \u00B7 '));
+
+        // Show execute button only when status allows it (e.g., after decomposition in dry run)
+        const showExecute = ['decomposing', 'pending', 'scanning'].includes(build.status)
+            || (build.config?.dry_run && build.status === 'done');
+        $('#btn-execute').toggle(!!showExecute);
+
+        // Show rebuild button when build failed or "done" with failures
+        const hasFailed = subtasks.some(t => t.status === 'failed');
+        const showRebuild = build.status === 'failed'
+            || (build.status === 'done' && hasFailed && completed < total);
+        $('#btn-rebuild').toggle(!!showRebuild).prop('disabled', false).text('Rebuild');
+
+        // Show commit button when build is done and has a git clone
+        const hasClone = !!build.config?.clone_path;
+        const isDone = build.status === 'done';
+        const alreadyCommitted = !!build.config?.committed;
+        if (isDone && hasClone) {
+            $('#btn-commit').show();
+            if (alreadyCommitted) {
+                const branchName = build.config?.branch || '';
+                $('#btn-commit').removeClass('btn-primary').addClass('btn-outline-success')
+                    .html('&#10003; ' + esc(branchName));
+                // Show PR button if we have a PR URL
+                const prUrl = build.config?.pr_url || '';
+                if (prUrl) {
+                    if ($('#btn-pr').length === 0) {
+                        $('#btn-commit').after(' <a id="btn-pr" href="' + esc(prUrl) + '" target="_blank" class="btn btn-sm btn-success">Create PR &rarr;</a>');
+                    } else {
+                        $('#btn-pr').attr('href', esc(prUrl)).show();
+                    }
+                }
+            } else {
+                $('#btn-commit').removeClass('btn-outline-success').addClass('btn-primary')
+                    .html('Commit &amp; Push');
+                $('#btn-pr').hide();
+            }
+            // Pre-fill the modal
+            $('#commit-branch').val(build.config?.branch || 'build/' + build.id.substring(0, 8));
+            $('#commit-message').val('feat: ' + (build.task || '').substring(0, 72));
+        } else {
+            $('#btn-commit').hide();
+        }
+
+        // Architecture context
+        if (build.architecture_context) {
+            $('#detail-arch-context').removeClass('d-none');
+            $('#arch-context-body').html(formatArchContext(build.architecture_context));
+        } else {
+            $('#detail-arch-context').addClass('d-none');
+        }
+
+        // Build error banner
+        if (build.error && (build.status === 'failed' || build.status === 'done')) {
+            let errorHtml = '<div class="alert alert-danger py-2 px-3 mb-3">';
+            errorHtml += '<strong>Build Failed:</strong> ' + esc(build.error);
+            errorHtml += '</div>';
+            $('#build-result').html(errorHtml).removeClass('d-none');
+        }
+
+        // Build result summary (assembled files)
+        const result = build.result;
+        if (result && build.status === 'done' && !hasFailed) {
+            const created = result.created || [];
+            const modified = result.modified || [];
+            const errors = result.errors || [];
+            const outputDir = build.config?.clone_path || build.project_path || '';
+
+            let resultHtml = '<div class="card bg-dark border-success mb-3"><div class="card-body py-2 px-3">';
+            resultHtml += '<div class="d-flex align-items-center gap-2 mb-2">';
+            resultHtml += '<span class="badge bg-success">Build Complete</span>';
+            resultHtml += `<span class="small text-muted">${created.length} created, ${modified.length} modified${errors.length ? ', ' + errors.length + ' errors' : ''}</span>`;
+            resultHtml += '</div>';
+
+            if (outputDir) {
+                resultHtml += `<div class="small mb-2"><span class="text-muted">Output:</span> <code class="text-info">${esc(outputDir)}</code></div>`;
+            }
+
+            if (created.length > 0) {
+                const fileItems = created.map(f => `<div class="py-1 border-bottom border-secondary"><code class="small text-success">${esc(f)}</code></div>`).join('');
+                resultHtml += `<details><summary class="small" style="cursor:pointer">Created Files (${created.length})</summary>`;
+                resultHtml += `<div class="mt-1 p-2" style="background:#0d1117;border-radius:6px;border:1px solid #30363d;">${fileItems}</div></details>`;
+            }
+
+            if (errors.length > 0) {
+                resultHtml += `<div class="mt-2 small text-danger">${errors.map(e => esc(e)).join('<br>')}</div>`;
+            }
+
+            resultHtml += '</div></div>';
+            $('#build-result').html(resultHtml).removeClass('d-none');
+        } else if (!build.error || (build.status !== 'failed' && build.status !== 'done')) {
+            $('#build-result').addClass('d-none').empty();
+        }
+
+        // Render subtask thread
+        if (subtasks.length > 0) {
+            renderSubtaskThread(subtasks);
+        } else {
+            $('#subtask-thread').html(
+                '<div class="text-center text-muted py-5">No subtasks yet. The decomposer will break the feature into subtasks.</div>'
+            );
+        }
+    }
+
+    // =====================================================================
+    // Render: Subtask thread (topological sort + indented)
+    // =====================================================================
+    function renderSubtaskThread(subtasks) {
+        // Preserve open <details> state across re-renders
+        const openDetails = {};
+        $('#subtask-thread details[open]').each(function() {
+            const card = $(this).closest('.subtask-card');
+            const taskId = card.data('task-id');
+            const type = $(this).find('summary').text().trim();
+            if (taskId) openDetails[taskId + ':' + type] = true;
+        });
+
+        const sorted = topologicalSort(subtasks);
+        const depthMap = computeDepths(sorted);
+        const statusMap = {};
+        subtasks.forEach(function(t) { statusMap[t.id] = t; });
+
+        let html = '';
+        sorted.forEach(function(task) {
+            const depth = Math.min(depthMap[task.id] || 0, 4);
+            const indentCls = depth > 0 ? ' thread-indent' + (depth > 1 ? '-' + depth : '') : '';
+            const statusNorm = (task.status || 'pending').toLowerCase();
+            const statusCardCls = 'status-' + statusNorm;
+
+            // Status icon
+            let statusIcon = '\u25CB'; // empty circle
+            if (statusNorm === 'completed') statusIcon = '\u25CF'; // filled circle
+            else if (statusNorm === 'generating') statusIcon = '<span class="spin">\u25E0</span>';
+            else if (statusNorm === 'failed') statusIcon = '\u2717';
+            else if (statusNorm === 'blocked') statusIcon = '\u25D4';
+            else if (statusNorm === 'validating') statusIcon = '\u25D4';
+
+            // Badges
+            const statusBadge = `<span class="badge ${STATUS_CLASSES[statusNorm] || 'bg-secondary'}">${esc(statusNorm)}</span>`;
+            const domainBadge = task.domain
+                ? `<span class="badge badge-domain-${esc(task.domain.toLowerCase())}">${esc(task.domain)}</span>`
+                : '';
+            const complexityBadge = task.complexity
+                ? `<span class="badge badge-complexity-${esc(task.complexity.toLowerCase())}">${esc(task.complexity)}</span>`
+                : '';
+            const attemptsBadge = (task.attempts || 0) > 1
+                ? `<span class="badge bg-warning text-dark" title="Took ${task.attempts} attempts to pass validation">${task.attempts} attempts</span>`
+                : '';
+
+            // Expert
+            const expert = task.expert || task.assigned_expert || '';
+
+            // Dependencies
+            const deps = task.depends_on || task.dependsOn || [];
+            let depsHtml = '';
+            if (deps.length > 0) {
+                const depParts = deps.map(function(depId) {
+                    const depTask = statusMap[depId];
+                    const depStatus = depTask ? (depTask.status || 'pending').toLowerCase() : 'pending';
+                    let symbol, cls;
+                    if (depStatus === 'completed') { symbol = '\u2713'; cls = 'dep-ok'; }
+                    else if (depStatus === 'generating' || depStatus === 'validating') { symbol = '\u231B'; cls = 'dep-progress'; }
+                    else if (depStatus === 'failed') { symbol = '\u2717'; cls = 'dep-fail'; }
+                    else { symbol = '\u25CB'; cls = 'dep-pending'; }
+                    const label = depTask ? shortId(depId) + (depTask.title ? ': ' + truncate(depTask.title, 30) : '') : shortId(depId);
+                    return `<span class="${cls}" title="${esc(depId)}">${esc(label)} ${symbol}</span>`;
+                });
+                depsHtml = `<div class="small text-muted mt-1">Depends on: ${depParts.join(', ')}</div>`;
+            } else {
+                depsHtml = `<div class="small text-muted mt-1">Depends on: (none)</div>`;
+            }
+
+            // Files generated
+            let filesHtml = '';
+            const files = task.files || [];
+            if (files.length > 0) {
+                const fileList = files.map(f => {
+                    const icon = f.action === 'modify' ? '\u270E' : '\u2795';
+                    return `<div class="d-flex align-items-center gap-1 py-1 border-bottom border-dark">
+                        <span class="text-muted">${icon}</span>
+                        <code class="small text-info">${esc(f.path)}</code>
+                        <span class="text-muted small ms-auto">${(f.content||'').length} bytes</span>
+                    </div>`;
+                }).join('');
+                filesHtml = `
+                <details class="mt-2">
+                    <summary class="small" style="cursor:pointer;">\uD83D\uDCC1 Files Generated (${files.length})</summary>
+                    <div class="mt-1 p-2" style="background:#0d1117;border-radius:6px;border:1px solid #30363d;">${fileList}</div>
+                </details>`;
+            }
+
+            // Code output
+            let codeHtml = '';
+            const code = task.generated_code || task.output || task.code_output || task.result || '';
+            if (code.length > 0) {
+                codeHtml = `
+                <details class="mt-1">
+                    <summary class="small" style="cursor:pointer;">\uD83D\uDCBB View Code Output (${code.length} chars)</summary>
+                    <div class="code-output mt-1">${esc(code)}</div>
+                </details>`;
+            }
+
+            // Work instructions (collapsed)
+            let instructionsHtml = '';
+            if (task.work_instructions) {
+                instructionsHtml = `
+                <details class="mt-1">
+                    <summary class="small text-muted" style="cursor:pointer;">Work Instructions</summary>
+                    <div class="code-output mt-1" style="max-height:200px;font-size:0.75rem;">${esc(task.work_instructions)}</div>
+                </details>`;
+            }
+
+            // Error message
+            let errorHtml = '';
+            if (statusNorm === 'failed' && task.error) {
+                errorHtml = `<div class="small text-danger mt-1">${esc(task.error)}</div>`;
+            }
+
+            html += `
+            <div class="${indentCls}">
+                <div class="card subtask-card ${statusCardCls} mb-2" data-task-id="${esc(task.id)}">
+                    <div class="card-body py-2 px-3">
+                        <div class="d-flex align-items-center gap-2">
+                            <span class="me-1">${statusIcon}</span>
+                            <strong class="small">${esc(shortId(task.id))}:</strong>
+                            <span class="small">${esc(task.title || task.description || 'Untitled subtask')}</span>
+                        </div>
+                        <div class="d-flex gap-2 mt-1 flex-wrap align-items-center">
+                            <span class="small text-muted">Status:</span> ${statusBadge}
+                            ${task.domain ? `<span class="small text-muted">Domain:</span> ${domainBadge}` : ''}
+                            ${task.complexity ? `<span class="small text-muted">Complexity:</span> ${complexityBadge}` : ''}
+                            ${attemptsBadge}
+                        </div>
+                        ${expert ? `<div class="small text-muted mt-1">Expert: <span class="text-light">${esc(expert)}</span></div>` : ''}
+                        ${depsHtml}
+                        ${errorHtml}
+                        ${filesHtml}
+                        ${codeHtml}
+                        ${instructionsHtml}
+                    </div>
+                </div>
+            </div>`;
+        });
+
+        const scrollY = window.scrollY;
+        $('#subtask-thread').html(html);
+
+        // Restore open <details> state
+        $('#subtask-thread details').each(function() {
+            const card = $(this).closest('.subtask-card');
+            const taskId = card.data('task-id');
+            const type = $(this).find('summary').text().trim();
+            if (taskId && openDetails[taskId + ':' + type]) {
+                $(this).attr('open', '');
+            }
+        });
+
+        // Restore scroll position
+        window.scrollTo(0, scrollY);
+    }
+
+    // =====================================================================
+    // Topological sort
+    // =====================================================================
+    function topologicalSort(subtasks) {
+        const taskMap = {};
+        subtasks.forEach(function(t) { taskMap[t.id] = t; });
+
+        const visited = {};
+        const order = [];
+
+        function visit(id) {
+            if (visited[id]) return;
+            visited[id] = true;
+            const task = taskMap[id];
+            if (task) {
+                const deps = task.depends_on || task.dependsOn || [];
+                deps.forEach(function(depId) {
+                    if (taskMap[depId]) visit(depId);
+                });
+                order.push(task);
+            }
+        }
+
+        subtasks.forEach(function(t) { visit(t.id); });
+        return order;
+    }
+
+    // =====================================================================
+    // Compute indent depths from dependency graph
+    // =====================================================================
+    function computeDepths(sortedTasks) {
+        const depths = {};
+        sortedTasks.forEach(function(task) {
+            const deps = task.depends_on || task.dependsOn || [];
+            if (deps.length === 0) {
+                depths[task.id] = 0;
+            } else {
+                let maxParentDepth = 0;
+                deps.forEach(function(depId) {
+                    if (depths[depId] !== undefined && depths[depId] >= maxParentDepth) {
+                        maxParentDepth = depths[depId] + 1;
+                    }
+                });
+                depths[task.id] = maxParentDepth;
+            }
+        });
+        return depths;
+    }
+
+    // =====================================================================
+    // Polling
+    // =====================================================================
+    function startPolling(id) {
+        stopPolling();
+        lastPollJson = null;
+        pollInterval = setInterval(function() {
+            if (currentBuildId !== id) { stopPolling(); return; }
+            $.getJSON('/api/builds/' + id)
+                .done(function(data) {
+                    // Only re-render if data actually changed
+                    const json = JSON.stringify(data);
+                    if (json !== lastPollJson) {
+                        lastPollJson = json;
+                        renderBuildDetail(data);
+                    }
+                    // Stop polling on terminal status
+                    const status = (data.build?.status || data.status || '').toLowerCase();
+                    if (status === 'done' || status === 'failed') {
+                        stopPolling();
+                    }
+                })
+                .fail(function() {
+                    // Silently ignore poll failures
+                });
+        }, 2000);
+    }
+
+    function stopPolling() {
+        if (pollInterval) {
+            clearInterval(pollInterval);
+            pollInterval = null;
+        }
+    }
+
+    // =====================================================================
+    // Form handlers
+    // =====================================================================
+    function onDecomposerChange() {
+        const val = $('#build-decomposer').val();
+        if (val === 'openai') {
+            $('#api-base-group').show();
+            if (!$('#build-decomposer-model').val()) {
+                $('#build-decomposer-model').attr('placeholder', 'gpt-4o');
+            }
+        } else {
+            $('#api-base-group').hide();
+            $('#build-decomposer-model').attr('placeholder', 'claude-sonnet-4-20250514');
+        }
+    }
+
+    function submitNewBuild() {
+        const task = $('#build-task').val().trim();
+        const projectPath = $('#build-project-path').val().trim();
+        if (!task || !projectPath) {
+            alert('Feature description and project path are required.');
+            return;
+        }
+
+        const settings = getSettings();
+        const decomposer = $('#build-decomposer').val() || settings.decomposer || 'anthropic';
+        const decomposerModel = $('#build-decomposer-model').val() || settings.decomposer_model || '';
+        const apiKey = $('#build-api-key').val() || settings.api_key || '';
+        const apiBase = $('#build-api-base').val() || settings.api_base || '';
+        const expertsRaw = $('#build-experts').val() || settings.experts || '';
+        const experts = expertsRaw.split(',').map(e => e.trim()).filter(e => e);
+        const dryRun = $('#build-dry-run').is(':checked');
+
+        // Update submit button text based on dry run
+        const payload = {
+            task: task,
+            project_path: projectPath,
+            config: {
+                decomposer: decomposer,
+                decomposer_model: decomposerModel,
+                api_key: apiKey,
+                api_base: apiBase,
+                experts: experts,
+                dry_run: dryRun
+            }
+        };
+
+        createBuild(payload);
+    }
+
+    // Update button text on dry-run toggle
+    $(document).on('change', '#build-dry-run', function() {
+        $('#btn-submit-build').text($(this).is(':checked') ? 'Preview Decomposition' : 'Build');
+    });
+
+    function confirmDeleteBuild(id) {
+        $('#btn-confirm-delete').off('click').on('click', function() {
+            deleteBuild(id);
+        });
+        new bootstrap.Modal(document.getElementById('deleteModal')).show();
+    }
+
+    // =====================================================================
+    // Helpers
+    // =====================================================================
+    function esc(str) {
+        if (str === null || str === undefined) return '';
+        const div = document.createElement('div');
+        div.appendChild(document.createTextNode(String(str)));
+        return div.innerHTML;
+    }
+
+    function truncate(str, max) {
+        if (!str) return '';
+        return str.length > max ? str.substring(0, max) + '...' : str;
+    }
+
+    function shortId(id) {
+        if (!id) return '?';
+        // If it looks like "subtask-N", keep it
+        if (id.startsWith('subtask-')) return id;
+        // UUID-like: show first 8 chars
+        return id.length > 12 ? id.substring(0, 8) : id;
+    }
+
+    function formatTs(ts) {
+        if (!ts) return '';
+        try {
+            const d = new Date(ts);
+            if (isNaN(d.getTime())) return ts;
+            const now = new Date();
+            const diff = (now - d) / 1000;
+            if (diff < 60) return 'just now';
+            if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+            if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+            return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+        } catch(e) {
+            return ts;
+        }
+    }
+
+    function formatArchContext(ctx) {
+        if (!ctx) return '';
+        // Simple text with possible newlines
+        return '<pre class="mb-0" style="white-space:pre-wrap;">' + esc(ctx) + '</pre>';
+    }
+
+    // =====================================================================
+    // URL routing (minimal)
+    // =====================================================================
+    function routeFromUrl() {
+        const params = new URLSearchParams(window.location.search);
+        const buildId = params.get('build');
+        if (buildId) {
+            showDetailView(buildId);
+        } else {
+            showListView();
+        }
+    }
+
+    window.addEventListener('popstate', function() {
+        routeFromUrl();
+    });
+
+    // =====================================================================
+    // Init
+    // =====================================================================
+    $(function() {
+        loadSettings();
+        routeFromUrl();
+    });
+    </script>
+</body>
+</html>

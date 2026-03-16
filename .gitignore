@@ -1,0 +1,27 @@
+# Composer
+vendor/
+composer.lock
+
+# Training & data
+training/
+data/
+unsloth_compiled_cache/
+
+# PHPUnit
+.phpunit.cache/
+
+# Node
+node_modules/
+
+# Config secrets
+conf/anthropic.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

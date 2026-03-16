@@ -1,0 +1,1334 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HalfBaked Distillery</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { font-family: 'Segoe UI', system-ui, sans-serif; }
+        .log-output {
+            font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+            font-size: 0.82rem;
+            background: #0d1117;
+            color: #c9d1d9;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 12px;
+            height: 320px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .wizard-step { display: none; }
+        .wizard-step.active { display: block; }
+        .step-indicator .step-dot {
+            width: 32px; height: 32px; border-radius: 50%;
+            display: inline-flex; align-items: center; justify-content: center;
+            font-size: 0.85rem; font-weight: 600;
+            background: #21262d; color: #8b949e; border: 2px solid #30363d;
+        }
+        .step-indicator .step-dot.active { background: #1f6feb; color: #fff; border-color: #1f6feb; }
+        .step-indicator .step-dot.completed { background: #238636; color: #fff; border-color: #238636; }
+        .step-indicator .step-line {
+            width: 48px; height: 2px; background: #30363d;
+            display: inline-block; vertical-align: middle; margin: 0 4px;
+        }
+        .step-indicator .step-line.completed { background: #238636; }
+        .model-size-card {
+            cursor: pointer; border: 2px solid #30363d; border-radius: 8px;
+            padding: 12px; transition: border-color 0.2s;
+        }
+        .model-size-card:hover { border-color: #58a6ff; }
+        .model-size-card.selected { border-color: #1f6feb; background: rgba(31,111,235,0.1); }
+        .model-size-card input[type="radio"] { display: none; }
+        .brand-text { font-weight: 700; letter-spacing: -0.5px; }
+        .table td, .table th { vertical-align: middle; }
+        .navbar { border-bottom: 1px solid #21262d; }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-sm">
+        <div class="container-fluid">
+            <a class="navbar-brand brand-text" href="#" onclick="showView('list')">HalfBaked Distillery</a>
+            <div class="navbar-nav ms-auto">
+                <a class="nav-link" href="/">Home</a>
+                <a class="nav-link" href="/builder">Builder</a>
+                <a class="nav-link active" href="#" onclick="showView('list')">Experts</a>
+                <a class="nav-link" href="#" onclick="showView('wizard')">New Expert</a>
+                <a class="nav-link" href="#" data-bs-toggle="modal" data-bs-target="#settingsModal">Settings</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container mt-4" id="app">
+
+        <!-- VIEW: Expert List -->
+        <div id="view-list">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+                <h4 class="mb-0">Expert Models</h4>
+                <div>
+                    <button class="btn btn-outline-secondary btn-sm me-2" data-bs-toggle="modal" data-bs-target="#importModal">Import Existing</button>
+                    <button class="btn btn-primary btn-sm" onclick="showView('wizard')">+ New Expert</button>
+                </div>
+            </div>
+            <div class="table-responsive">
+                <table class="table table-sm table-hover">
+                    <thead>
+                        <tr>
+                            <th>Name</th><th>Language</th><th>Status</th><th>Samples</th>
+                            <th>Dataset</th><th>Loss</th><th>GGUF</th><th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="experts-body">
+                        <tr><td colspan="8" class="text-muted text-center py-4">Loading...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div id="empty-state" class="text-center py-5 d-none">
+                <p class="text-muted mb-3">No expert models yet. Create one from a codebase to get started.</p>
+                <button class="btn btn-outline-primary" onclick="showView('wizard')">Create First Expert</button>
+            </div>
+        </div>
+
+        <!-- VIEW: New Expert Wizard -->
+        <div id="view-wizard" class="d-none">
+            <div class="row justify-content-center">
+                <div class="col-lg-8">
+                    <h4 class="mb-3">New Expert Model</h4>
+                    <div class="step-indicator text-center mb-4">
+                        <span class="step-dot active" id="dot-1">1</span>
+                        <span class="step-line" id="line-1"></span>
+                        <span class="step-dot" id="dot-2">2</span>
+                        <span class="step-line" id="line-2"></span>
+                        <span class="step-dot" id="dot-3">3</span>
+                        <span class="step-line" id="line-3"></span>
+                        <span class="step-dot" id="dot-4">4</span>
+                    </div>
+
+                    <!-- Step 1: Source -->
+                    <div class="wizard-step active" id="step-1">
+                        <div class="card">
+                            <div class="card-body">
+                                <h5 class="card-title mb-3">Source Codebases</h5>
+                                <div class="mb-3">
+                                    <label class="form-label">Repository URLs or Local Paths</label>
+                                    <div id="sources-list">
+                                        <div class="input-group mb-2 source-row">
+                                            <input type="text" class="form-control source-input"
+                                                   placeholder="https://github.com/user/repo.git or /path/to/project"
+                                                   autocomplete="off">
+                                            <button class="btn btn-outline-secondary" type="button"
+                                                    onclick="detectSourceRow(this)">Detect</button>
+                                        </div>
+                                    </div>
+                                    <button class="btn btn-sm btn-outline-secondary" type="button" onclick="addSourceRow()">+ Add Source</button>
+                                    <div class="form-text mt-1">Add multiple repos/paths to train one expert from all of them.</div>
+                                </div>
+                                <div id="detect-result" class="d-none mb-3">
+                                    <div class="alert alert-info py-2 mb-2">
+                                        <strong>Detected:</strong>
+                                        <span id="detect-language">-</span>
+                                        <span id="detect-frameworks" class="ms-2"></span>
+                                        <span id="detect-confidence" class="ms-2 text-muted small"></span>
+                                    </div>
+                                    <div id="detect-note" class="form-text"></div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">Language Override</label>
+                                    <select class="form-select" id="language-select">
+                                        <option value="auto">Auto-detect</option>
+                                        <option value="PHP">PHP</option>
+                                        <option value="Python">Python</option>
+                                        <option value="JavaScript">JavaScript</option>
+                                        <option value="TypeScript">TypeScript</option>
+                                        <option value="CSS">CSS</option>
+                                        <option value="Go">Go</option>
+                                        <option value="Rust">Rust</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="card-footer d-flex justify-content-between">
+                                <button class="btn btn-outline-secondary" onclick="showView('list')">Cancel</button>
+                                <button class="btn btn-primary" onclick="wizardNext(2)">Next: Configuration</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Step 2: Configuration -->
+                    <div class="wizard-step" id="step-2">
+                        <div class="card">
+                            <div class="card-body">
+                                <h5 class="card-title mb-3">Configuration</h5>
+                                <div class="mb-3">
+                                    <label class="form-label">Expert Name</label>
+                                    <input type="text" class="form-control" id="expert-name"
+                                           placeholder="Auto-filled from repo name">
+                                </div>
+                                <div class="mb-4">
+                                    <label class="form-label">Model Size</label>
+                                    <div class="row g-2">
+                                        <div class="col-6 col-md-3">
+                                            <label class="model-size-card d-block text-center" onclick="selectModelSize('0.5B', this)">
+                                                <input type="radio" name="model_size" value="0.5B">
+                                                <div class="fw-bold">0.5B</div>
+                                                <div class="small text-muted">~0.5GB Q8</div>
+                                                <div class="small text-muted">~48 in 24GB</div>
+                                                <div class="small mt-1 text-info">Autocomplete only</div>
+                                            </label>
+                                        </div>
+                                        <div class="col-6 col-md-3">
+                                            <label class="model-size-card d-block text-center" onclick="selectModelSize('1.5B', this)">
+                                                <input type="radio" name="model_size" value="1.5B">
+                                                <div class="fw-bold">1.5B</div>
+                                                <div class="small text-muted">~1.6GB Q8</div>
+                                                <div class="small text-muted">~15 in 24GB</div>
+                                                <div class="small mt-1 text-info">Templates &amp; scaffolding</div>
+                                            </label>
+                                        </div>
+                                        <div class="col-6 col-md-3">
+                                            <label class="model-size-card d-block text-center" onclick="selectModelSize('3B', this)">
+                                                <input type="radio" name="model_size" value="3B">
+                                                <div class="fw-bold">3B</div>
+                                                <div class="small text-muted">~3.3GB Q8</div>
+                                                <div class="small text-muted">~7 in 24GB</div>
+                                                <div class="small mt-1 text-info">Good general code</div>
+                                            </label>
+                                        </div>
+                                        <div class="col-6 col-md-3">
+                                            <label class="model-size-card d-block text-center selected" onclick="selectModelSize('7B', this)">
+                                                <input type="radio" name="model_size" value="7B" checked>
+                                                <div class="fw-bold">7B</div>
+                                                <div class="small text-muted">~7.5GB Q8</div>
+                                                <div class="small text-muted">~3 in 24GB</div>
+                                                <div class="small mt-1 text-info">Best quality (default)</div>
+                                            </label>
+                                        </div>
+                                        <div class="col-6 col-md-3">
+                                            <label class="model-size-card d-block text-center" onclick="selectModelSize('9B', this)">
+                                                <input type="radio" name="model_size" value="9B">
+                                                <div class="fw-bold">9B</div>
+                                                <div class="small text-muted">~9GB Q8</div>
+                                                <div class="small text-muted">~2 in 24GB</div>
+                                                <div class="small mt-1 text-info">Best for code gen</div>
+                                            </label>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">Custom HuggingFace Model ID <span class="text-muted small">(optional override)</span></label>
+                                    <input type="text" class="form-control font-monospace" id="custom-base-model"
+                                           placeholder="e.g., Qwen/Qwen3.5-9B">
+                                    <div class="form-text">When set, overrides the model size selection above. Unsloth downloads from HuggingFace directly.</div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">Target Examples: <strong id="samples-display">1000</strong></label>
+                                    <input type="range" class="form-range" id="target-samples"
+                                           min="50" max="2000" value="1000" step="50"
+                                           oninput="updateEstimates()">
+                                    <div class="d-flex justify-content-between small text-muted">
+                                        <span>50</span><span>2000</span>
+                                    </div>
+                                </div>
+                                <div class="row mb-2">
+                                    <div class="col-6">
+                                        <div class="small text-muted">Estimated cost (Claude API):</div>
+                                        <div class="fw-bold" id="est-cost">$5.00</div>
+                                    </div>
+                                    <div class="col-6">
+                                        <div class="small text-muted">Estimated time:</div>
+                                        <div class="fw-bold" id="est-time">~45 min distill + ~60 min train</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="card-footer d-flex justify-content-between">
+                                <button class="btn btn-outline-secondary" onclick="wizardNext(1)">Back</button>
+                                <button class="btn btn-primary" onclick="startDistillation()">Start Distillation</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Step 3: Progress -->
+                    <div class="wizard-step" id="step-3">
+                        <div class="card">
+                            <div class="card-body">
+                                <h5 class="card-title mb-3">Distillation in Progress</h5>
+                                <div class="mb-3">
+                                    <div class="d-flex justify-content-between mb-1">
+                                        <small id="progress-step-label">Starting...</small>
+                                        <small id="progress-percent">0%</small>
+                                    </div>
+                                    <div class="progress" style="height: 8px;">
+                                        <div class="progress-bar progress-bar-striped progress-bar-animated"
+                                             id="progress-bar" style="width: 0%"></div>
+                                    </div>
+                                    <div class="d-flex justify-content-between mt-1">
+                                        <small class="text-muted">
+                                            Cloning - Detecting - Extracting - Distilling - Training - Exporting
+                                        </small>
+                                    </div>
+                                </div>
+                                <!-- Sub-progress for current step -->
+                                <div id="sub-progress-wrap" class="mb-3 d-none">
+                                    <div class="d-flex justify-content-between mb-1">
+                                        <small id="sub-progress-label" class="text-muted">Batch 0/0</small>
+                                        <small id="sub-progress-percent" class="text-muted">0%</small>
+                                    </div>
+                                    <div class="progress" style="height: 5px;">
+                                        <div class="progress-bar bg-info" id="sub-progress-bar" style="width: 0%"></div>
+                                    </div>
+                                </div>
+                                <div class="row mb-3">
+                                    <div class="col-3 text-center">
+                                        <div class="small text-muted">Samples</div>
+                                        <div class="fw-bold" id="metric-samples">0</div>
+                                    </div>
+                                    <div class="col-3 text-center">
+                                        <div class="small text-muted">Dataset Pairs</div>
+                                        <div class="fw-bold" id="metric-dataset">0</div>
+                                    </div>
+                                    <div class="col-3 text-center">
+                                        <div class="small text-muted">Training Loss</div>
+                                        <div class="fw-bold" id="metric-loss">-</div>
+                                    </div>
+                                    <div class="col-3 text-center">
+                                        <div class="small text-muted">ETA</div>
+                                        <div class="fw-bold" id="metric-eta">-</div>
+                                    </div>
+                                </div>
+                                <div class="log-output" id="progress-log"></div>
+                            </div>
+                            <div class="card-footer d-flex justify-content-between">
+                                <button class="btn btn-outline-secondary" onclick="showView('list')">Background</button>
+                                <span class="text-muted small align-self-center">Runs in background if you navigate away</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Step 4: Complete -->
+                    <div class="wizard-step" id="step-4">
+                        <div class="card">
+                            <div class="card-body text-center">
+                                <div class="mb-3"><span class="display-4 text-success">&#10003;</span></div>
+                                <h5 class="card-title mb-3">Expert Model Ready</h5>
+                                <div class="row text-start mb-3">
+                                    <div class="col-md-6 offset-md-3">
+                                        <table class="table table-sm">
+                                            <tr><td class="text-muted">Name</td><td id="complete-name">-</td></tr>
+                                            <tr><td class="text-muted">Language</td><td id="complete-language">-</td></tr>
+                                            <tr><td class="text-muted">Model Size</td><td id="complete-model-size">-</td></tr>
+                                            <tr><td class="text-muted">GGUF Path</td><td><code id="complete-gguf">-</code></td></tr>
+                                            <tr><td class="text-muted">GGUF Size</td><td id="complete-gguf-size">-</td></tr>
+                                            <tr><td class="text-muted">Training Loss</td><td id="complete-loss">-</td></tr>
+                                        </table>
+                                    </div>
+                                </div>
+                                <div class="mb-3 text-start">
+                                    <div class="col-md-8 offset-md-2">
+                                        <label class="form-label small text-muted">Quick test:</label>
+                                        <div class="input-group input-group-sm mb-2">
+                                            <input type="text" class="form-control font-monospace" id="cmd-test" readonly>
+                                            <button class="btn btn-outline-secondary" onclick="copyCmd('cmd-test')">Copy</button>
+                                        </div>
+                                        <label class="form-label small text-muted">Use with HalfBaked:</label>
+                                        <div class="input-group input-group-sm">
+                                            <input type="text" class="form-control font-monospace" id="cmd-halfbaked" readonly>
+                                            <button class="btn btn-outline-secondary" onclick="copyCmd('cmd-halfbaked')">Copy</button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="card-footer d-flex justify-content-between">
+                                <button class="btn btn-outline-secondary" onclick="showView('list')">Back to List</button>
+                                <button class="btn btn-primary" onclick="resetWizard(); showView('wizard')">Create Another</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- VIEW: Expert Detail -->
+        <div id="view-detail" class="d-none">
+            <div class="d-flex align-items-center mb-3">
+                <button class="btn btn-sm btn-outline-secondary me-3" onclick="showView('list')">&larr; Back</button>
+                <h4 class="mb-0" id="detail-title">Expert Detail</h4>
+            </div>
+            <div class="row">
+                <div class="col-md-6">
+                    <div class="card mb-3">
+                        <div class="card-header">Metadata</div>
+                        <div class="card-body">
+                            <table class="table table-sm mb-0">
+                                <tr><td class="text-muted" style="width:140px">ID</td><td id="detail-id">-</td></tr>
+                                <tr><td class="text-muted">Name</td><td id="detail-name">-</td></tr>
+                                <tr><td class="text-muted">Source</td><td id="detail-source">-</td></tr>
+                                <tr><td class="text-muted">Language</td><td id="detail-language">-</td></tr>
+                                <tr><td class="text-muted">Framework</td><td id="detail-framework">-</td></tr>
+                                <tr><td class="text-muted">Status</td><td id="detail-status">-</td></tr>
+                                <tr><td class="text-muted">Model Size</td><td id="detail-model-size">-</td></tr>
+                                <tr><td class="text-muted">Samples</td><td id="detail-samples">-</td></tr>
+                                <tr><td class="text-muted">Dataset Pairs</td><td id="detail-dataset">-</td></tr>
+                                <tr><td class="text-muted">Training Loss</td><td id="detail-loss">-</td></tr>
+                                <tr><td class="text-muted">GGUF Path</td><td><code id="detail-gguf">-</code></td></tr>
+                                <tr><td class="text-muted">GGUF Size</td><td id="detail-gguf-size">-</td></tr>
+                                <tr><td class="text-muted">Error</td><td id="detail-error" class="text-danger">-</td></tr>
+                                <tr><td class="text-muted">Created</td><td id="detail-created">-</td></tr>
+                                <tr><td class="text-muted">Updated</td><td id="detail-updated">-</td></tr>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <!-- Configuration snapshot -->
+                    <div class="card mb-3 d-none" id="detail-config-card">
+                        <div class="card-header">Configuration Snapshot</div>
+                        <div class="card-body">
+                            <table class="table table-sm mb-0" id="detail-config-table">
+                            </table>
+                        </div>
+                    </div>
+                    <!-- Progress card (visible during active distillation) -->
+                    <div class="card mb-3 d-none" id="detail-progress-card">
+                        <div class="card-header">Progress</div>
+                        <div class="card-body">
+                            <div class="d-flex justify-content-between mb-1">
+                                <small id="detail-progress-step" class="fw-bold">-</small>
+                                <small id="detail-progress-pct" class="text-muted">0%</small>
+                            </div>
+                            <div class="progress mb-2" style="height: 6px;">
+                                <div class="progress-bar progress-bar-striped progress-bar-animated" id="detail-progress-bar" style="width: 0%"></div>
+                            </div>
+                            <div class="d-flex justify-content-between mb-1">
+                                <small id="detail-sub-label" class="text-muted">-</small>
+                                <small id="detail-sub-pct" class="text-muted">-</small>
+                            </div>
+                            <div class="progress mb-2" style="height: 4px;">
+                                <div class="progress-bar bg-info" id="detail-sub-bar" style="width: 0%"></div>
+                            </div>
+                            <div class="row text-center">
+                                <div class="col"><small class="text-muted">Pairs</small><div class="fw-bold" id="detail-live-pairs">0</div></div>
+                                <div class="col"><small class="text-muted">Batch</small><div class="fw-bold" id="detail-live-batch">-</div></div>
+                                <div class="col"><small class="text-muted">ETA</small><div class="fw-bold" id="detail-live-eta">-</div></div>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Retry panel (visible when failed) -->
+                    <div class="card mb-3 d-none border-danger" id="detail-retry-card">
+                        <div class="card-header bg-danger bg-opacity-25">Retry Distillation</div>
+                        <div class="card-body">
+                            <div class="mb-3">
+                                <label class="form-label fw-bold">Resume from step</label>
+                                <select class="form-select" id="retry-step">
+                                    <option value="clone-repo">clone-repo (start over)</option>
+                                    <option value="detect-language">detect-language</option>
+                                    <option value="extract-code">extract-code</option>
+                                    <option value="generate-dataset">generate-dataset</option>
+                                    <option value="train-model">train-model</option>
+                                    <option value="export-gguf">export-gguf</option>
+                                </select>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label fw-bold">Model Size</label>
+                                <div class="d-flex flex-wrap gap-2" id="retry-model-sizes">
+                                    <div class="form-check form-check-inline"><input class="form-check-input" type="radio" name="retry-size" id="retry-size-05b" value="0.5b"><label class="form-check-label" for="retry-size-05b">0.5B</label></div>
+                                    <div class="form-check form-check-inline"><input class="form-check-input" type="radio" name="retry-size" id="retry-size-15b" value="1.5b"><label class="form-check-label" for="retry-size-15b">1.5B</label></div>
+                                    <div class="form-check form-check-inline"><input class="form-check-input" type="radio" name="retry-size" id="retry-size-3b" value="3b"><label class="form-check-label" for="retry-size-3b">3B</label></div>
+                                    <div class="form-check form-check-inline"><input class="form-check-input" type="radio" name="retry-size" id="retry-size-7b" value="7b" checked><label class="form-check-label" for="retry-size-7b">7B</label></div>
+                                    <div class="form-check form-check-inline"><input class="form-check-input" type="radio" name="retry-size" id="retry-size-9b" value="9b"><label class="form-check-label" for="retry-size-9b">9B</label></div>
+                                    <div class="form-check form-check-inline"><input class="form-check-input" type="radio" name="retry-size" id="retry-size-14b" value="14b"><label class="form-check-label" for="retry-size-14b">14B</label></div>
+                                </div>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label fw-bold">Custom Base Model <small class="text-muted">(overrides size selection)</small></label>
+                                <input type="text" class="form-control" id="retry-base-model" placeholder="e.g. unsloth/Qwen3.5-9B">
+                            </div>
+                            <button class="btn btn-danger" id="retry-btn" onclick="retryDistillation()">Retry</button>
+                        </div>
+                    </div>
+                    <div class="card mb-3">
+                        <div class="card-header d-flex justify-content-between align-items-center">
+                            <span>Logs</span>
+                            <select class="form-select form-select-sm" style="width: auto;" id="detail-log-step"
+                                    onchange="loadDetailLogs()">
+                                <option value="">Current</option>
+                            </select>
+                        </div>
+                        <div class="card-body p-0">
+                            <div class="log-output" id="detail-log-output" style="border: none; border-radius: 0;"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div class="modal fade" id="settingsModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Distillery Settings</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <h6 class="text-muted mb-2">Dataset Generation (Teacher Model)</h6>
+                    <div class="mb-3">
+                        <label class="form-label">Provider</label>
+                        <select class="form-select" id="setting-distill-provider" onchange="toggleProviderFields()">
+                            <option value="anthropic">Anthropic (Claude API)</option>
+                            <option value="openai">OpenAI-Compatible (Ollama, OpenRouter, Together, Groq, OpenAI)</option>
+                        </select>
+                        <div class="form-text">Which LLM generates the training dataset. Claude gives best quality; OpenAI-compatible works with any provider.</div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Model</label>
+                        <input type="text" class="form-control font-monospace" id="setting-distill-model"
+                               placeholder="Default: claude-sonnet-4-20250514 or kimi2.5:cloud">
+                        <div class="form-text">Leave blank for default. Examples: kimi2.5:cloud, qwen3:32b, gpt-4o, llama3.3:70b</div>
+                    </div>
+                    <div id="openai-fields" class="d-none">
+                        <div class="mb-3">
+                            <label class="form-label">API Base URL</label>
+                            <input type="text" class="form-control font-monospace" id="setting-api-base"
+                                   placeholder="http://127.0.0.1:11434/v1">
+                            <div class="form-text">Ollama: http://127.0.0.1:11434/v1 &bull; OpenRouter: https://openrouter.ai/api/v1 &bull; Together: https://api.together.xyz/v1</div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">API Key (if required)</label>
+                            <input type="password" class="form-control font-monospace" id="setting-openai-key"
+                                   placeholder="Not needed for local Ollama">
+                            <div class="form-text">Required for OpenRouter, Together, Groq, OpenAI. Not needed for local Ollama.</div>
+                        </div>
+                    </div>
+                    <div id="anthropic-fields">
+                        <div class="mb-3">
+                            <label class="form-label">Anthropic API Key</label>
+                            <div class="input-group">
+                                <input type="password" class="form-control font-monospace" id="setting-api-key"
+                                       placeholder="sk-ant-api03-...">
+                                <button class="btn btn-outline-secondary" type="button" onclick="toggleKeyVisibility()">Show</button>
+                            </div>
+                            <div class="form-text">Required when using Anthropic. <span id="key-status" class="text-muted"></span></div>
+                        </div>
+                    </div>
+                    <hr>
+                    <h6 class="text-muted mb-2">Ollama (Training & Inference)</h6>
+                    <div class="mb-3">
+                        <label class="form-label">Ollama Host</label>
+                        <input type="text" class="form-control" id="setting-ollama-host" placeholder="127.0.0.1">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Ollama Port</label>
+                        <input type="number" class="form-control" id="setting-ollama-port" placeholder="11434">
+                    </div>
+                    <hr>
+                    <div class="mb-3">
+                        <label class="form-label">Python Path</label>
+                        <input type="text" class="form-control font-monospace" id="setting-python-path"
+                               placeholder="Auto-detect (training/.venv/bin/python3 or python3)">
+                        <div class="form-text">Override the Python binary used for extraction, distillation, and training. Leave blank to auto-detect.</div>
+                    </div>
+                    <div id="settings-saved" class="alert alert-success py-1 d-none small">Settings saved.</div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                    <button type="button" class="btn btn-primary" onclick="saveSettings()">Save</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Import Expert Modal -->
+    <div class="modal fade" id="importModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Import Existing Expert</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="text-muted small">Register an existing GGUF model that was trained outside the Distillery pipeline.</p>
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Expert Name <span class="text-danger">*</span></label>
+                                <input type="text" class="form-control" id="import-name" placeholder="e.g. voidlux-coder">
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">Ollama Model Name</label>
+                                <input type="text" class="form-control font-monospace" id="import-ollama" placeholder="e.g. voidlux-coder">
+                                <div class="form-text">If already registered in Ollama. Size will be auto-detected.</div>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">GGUF Path</label>
+                                <input type="text" class="form-control font-monospace" id="import-gguf" placeholder="/path/to/model-Q8_0.gguf">
+                                <div class="form-text">Path to GGUF file on disk (optional if Ollama model set).</div>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">Source Repo / Path</label>
+                                <input type="text" class="form-control" id="import-source" placeholder="https://github.com/user/project or /local/path">
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Language</label>
+                                <select class="form-select" id="import-language">
+                                    <option value="">Unknown</option>
+                                    <option value="php">PHP</option>
+                                    <option value="python">Python</option>
+                                    <option value="javascript">JavaScript</option>
+                                    <option value="css">CSS</option>
+                                    <option value="go">Go</option>
+                                    <option value="rust">Rust</option>
+                                    <option value="cpp">C++</option>
+                                </select>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">Framework(s)</label>
+                                <input type="text" class="form-control" id="import-framework" placeholder="e.g. FlightPHP, RedBeanPHP">
+                            </div>
+                            <div class="row">
+                                <div class="col-6 mb-3">
+                                    <label class="form-label">Model Size</label>
+                                    <select class="form-select" id="import-model-size">
+                                        <option value="0.5b">0.5B</option>
+                                        <option value="1.5b">1.5B</option>
+                                        <option value="3b">3B</option>
+                                        <option value="7b" selected>7B</option>
+                                        <option value="9b">9B</option>
+                                        <option value="14b">14B</option>
+                                    </select>
+                                </div>
+                                <div class="col-6 mb-3">
+                                    <label class="form-label">Training Loss</label>
+                                    <input type="number" class="form-control" id="import-loss" step="0.0001" placeholder="0.0000">
+                                </div>
+                            </div>
+                            <div class="row">
+                                <div class="col-6 mb-3">
+                                    <label class="form-label">Code Samples</label>
+                                    <input type="number" class="form-control" id="import-samples" placeholder="0">
+                                </div>
+                                <div class="col-6 mb-3">
+                                    <label class="form-label">Training Pairs</label>
+                                    <input type="number" class="form-control" id="import-dataset" placeholder="0">
+                                </div>
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">Base Model</label>
+                                <input type="text" class="form-control font-monospace" id="import-base-model" placeholder="e.g. unsloth/Qwen2.5-Coder-7B-Instruct">
+                            </div>
+                        </div>
+                    </div>
+                    <div id="import-error" class="alert alert-danger py-1 d-none small"></div>
+                    <div id="import-success" class="alert alert-success py-1 d-none small"></div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" onclick="importExpert()">Import</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+    var currentView = 'list';
+    var currentExpertId = null;
+    var wizardStep = 1;
+    var selectedModelSize = '7B';
+    var refreshTimer = null;
+    var logTimer = null;
+
+    function showView(view) {
+        document.getElementById('view-list').classList.add('d-none');
+        document.getElementById('view-wizard').classList.add('d-none');
+        document.getElementById('view-detail').classList.add('d-none');
+        document.getElementById('view-' + view).classList.remove('d-none');
+        currentView = view;
+        clearInterval(refreshTimer);
+        clearInterval(logTimer);
+        clearInterval(detailTimer);
+        if (view === 'list') {
+            loadExperts();
+            refreshTimer = setInterval(loadExperts, 5000);
+        } else if (view === 'detail') {
+            loadExpertDetail(currentExpertId);
+        }
+    }
+
+    async function loadExperts() {
+        try {
+            var res = await fetch('/api/experts');
+            var data = await res.json();
+            var experts = data.experts || [];
+            var tbody = document.getElementById('experts-body');
+            var empty = document.getElementById('empty-state');
+            if (experts.length === 0) {
+                tbody.innerHTML = '';
+                empty.classList.remove('d-none');
+                return;
+            }
+            empty.classList.add('d-none');
+            tbody.innerHTML = experts.map(function(e) {
+                var badge = statusBadge(e.status);
+                var ggufSize = e.gguf_size > 0 ? formatBytes(e.gguf_size) : '-';
+                var loss = e.training_loss > 0 ? Number(e.training_loss).toFixed(4) : '-';
+                var importedBadge = (e.config && e.config.imported) ? ' <span class="badge bg-dark text-muted">imported</span>' : '';
+                return '<tr>' +
+                    '<td><strong>' + esc(e.name) + '</strong>' + importedBadge + '</td>' +
+                    '<td>' + esc(e.language || '-') + '</td>' +
+                    '<td>' + badge + '</td>' +
+                    '<td>' + (e.samples_count || 0) + '</td>' +
+                    '<td>' + (e.dataset_count || 0) + '</td>' +
+                    '<td>' + loss + '</td>' +
+                    '<td>' + ggufSize + '</td>' +
+                    '<td>' +
+                        '<button class="btn btn-sm btn-outline-secondary me-1" onclick="viewExpert(\'' + e.id + '\')">Details</button>' +
+                        '<button class="btn btn-sm btn-outline-danger" onclick="removeExpert(\'' + e.id + '\', \'' + esc(e.name).replace(/'/g, "\\'") + '\')">Remove</button>' +
+                    '</td></tr>';
+            }).join('');
+        } catch (err) { console.error('Failed to load experts:', err); }
+    }
+
+    function statusBadge(status) {
+        var colors = { pending:'secondary', cloning:'info', detecting:'info', extracting:'info', distilling:'primary', training:'warning', exporting:'info', ready:'success', failed:'danger' };
+        return '<span class="badge bg-' + (colors[status] || 'secondary') + '">' + esc(status) + '</span>';
+    }
+
+    async function removeExpert(id, name) {
+        if (!confirm('Remove expert "' + name + '"? This will delete the GGUF file if it exists.')) return;
+        try { await fetch('/api/experts/' + id, { method: 'DELETE' }); loadExperts(); }
+        catch (err) { alert('Failed to remove: ' + err.message); }
+    }
+
+    function viewExpert(id) { currentExpertId = id; showView('detail'); }
+
+    async function loadExpertDetail(id) {
+        if (!id) return;
+        try {
+            var res = await fetch('/api/experts/' + id);
+            var data = await res.json();
+            var e = data.expert;
+            if (!e) return;
+            document.getElementById('detail-title').textContent = e.name;
+            document.getElementById('detail-id').textContent = e.id;
+            document.getElementById('detail-name').textContent = e.name;
+            document.getElementById('detail-source').textContent = e.source_url;
+            document.getElementById('detail-language').textContent = e.language || '-';
+            document.getElementById('detail-framework').textContent = e.framework || '-';
+            document.getElementById('detail-status').innerHTML = statusBadge(e.status);
+            document.getElementById('detail-model-size').textContent = e.model_size || '-';
+            document.getElementById('detail-samples').textContent = e.samples_count || '0';
+            document.getElementById('detail-dataset').textContent = e.dataset_count || '0';
+            document.getElementById('detail-loss').textContent = e.training_loss > 0 ? Number(e.training_loss).toFixed(4) : '-';
+            document.getElementById('detail-gguf').textContent = e.gguf_path || '-';
+            document.getElementById('detail-gguf-size').textContent = e.gguf_size > 0 ? formatBytes(e.gguf_size) : '-';
+            document.getElementById('detail-error').textContent = e.error || '-';
+            document.getElementById('detail-created').textContent = e.created_at;
+            document.getElementById('detail-updated').textContent = e.updated_at;
+
+            // Populate config snapshot
+            var configCard = document.getElementById('detail-config-card');
+            var configTable = document.getElementById('detail-config-table');
+            var cfg = e.config || {};
+            var configKeys = Object.keys(cfg);
+            if (configKeys.length > 0) {
+                configCard.classList.remove('d-none');
+                var configLabels = {
+                    'model_size': 'Model Size',
+                    'base_model': 'Base Model',
+                    'target_examples': 'Target Examples',
+                    'target_samples': 'Target Samples',
+                    'distill_provider': 'Provider',
+                    'distill_model': 'Teacher Model',
+                    'api_base': 'API Base URL',
+                    'language': 'Language',
+                    'started_at': 'Run Started',
+                    'python_bin': 'Python Binary',
+                    'created_at': 'Config Created',
+                };
+                var skipKeys = ['api_key', 'openai_api_key'];
+                var html = '';
+                configKeys.forEach(function(k) {
+                    if (skipKeys.indexOf(k) >= 0) return;
+                    var val = cfg[k];
+                    if (val === null || val === undefined || val === '') return;
+                    var label = configLabels[k] || k.replace(/_/g, ' ').replace(/\b\w/g, function(l) { return l.toUpperCase(); });
+                    html += '<tr><td class="text-muted" style="width:140px">' + label + '</td><td><code>' + String(val) + '</code></td></tr>';
+                });
+                configTable.innerHTML = html;
+            } else {
+                configCard.classList.add('d-none');
+            }
+
+            loadDetailLogs();
+
+            // Show/hide retry panel
+            var retryCard = document.getElementById('detail-retry-card');
+            if (e.status === 'failed') {
+                retryCard.classList.remove('d-none');
+                // Pre-select the failed step from error message
+                var failedStep = '';
+                if (e.error && e.error.match(/Failed at ([a-z-]+):/)) {
+                    failedStep = e.error.match(/Failed at ([a-z-]+):/)[1];
+                }
+                if (failedStep) {
+                    document.getElementById('retry-step').value = failedStep;
+                }
+                // Pre-fill model size from config
+                var cfgSize = (e.config && e.config.model_size) ? e.config.model_size.toLowerCase() : '7b';
+                var sizeRadio = document.querySelector('input[name="retry-size"][value="' + cfgSize + '"]');
+                if (sizeRadio) sizeRadio.checked = true;
+                // Pre-fill base model
+                document.getElementById('retry-base-model').value = (e.config && e.config.base_model) ? e.config.base_model : '';
+                // Reset button state
+                document.getElementById('retry-btn').disabled = false;
+                document.getElementById('retry-btn').textContent = 'Retry';
+            } else {
+                retryCard.classList.add('d-none');
+            }
+
+            // Start progress polling for active distillations
+            var activeStatuses = ['cloning','detecting','extracting','distilling','training','exporting','pending'];
+            clearInterval(detailTimer);
+            if (activeStatuses.indexOf(e.status) >= 0) {
+                document.getElementById('detail-progress-card').classList.remove('d-none');
+                detailStartTime = null;
+                detailLastBatch = 0;
+                pollDetailProgress();
+                detailTimer = setInterval(function() {
+                    pollDetailProgress();
+                    loadDetailLogs();
+                }, 3000);
+            } else {
+                document.getElementById('detail-progress-card').classList.add('d-none');
+            }
+        } catch (err) { console.error('Failed to load expert:', err); }
+    }
+
+    var detailTimer = null;
+    var detailStartTime = null;
+    var detailLastBatch = 0;
+
+    async function pollDetailProgress() {
+        if (!currentExpertId) return;
+        try {
+            var [expertRes, progressRes] = await Promise.all([
+                fetch('/api/experts/' + currentExpertId),
+                fetch('/api/experts/' + currentExpertId + '/progress')
+            ]);
+            var expertData = await expertRes.json();
+            var progressData = await progressRes.json();
+            var e = expertData.expert;
+            var p = progressData.progress || {};
+            if (!e) return;
+
+            // Update metadata
+            document.getElementById('detail-status').innerHTML = statusBadge(e.status);
+            document.getElementById('detail-dataset').textContent = p.dataset_pairs || e.dataset_count || '0';
+            document.getElementById('detail-loss').textContent = e.training_loss > 0 ? Number(e.training_loss).toFixed(4) : '-';
+
+            // Overall step progress
+            var stepOrder = ['pending','cloning','detecting','extracting','distilling','training','exporting','ready'];
+            var stepIdx = stepOrder.indexOf(e.status);
+            var pct = Math.min(100, Math.round((stepIdx / (stepOrder.length - 1)) * 100));
+            document.getElementById('detail-progress-bar').style.width = pct + '%';
+            document.getElementById('detail-progress-pct').textContent = pct + '%';
+            document.getElementById('detail-progress-step').textContent = statusLabel(e.status);
+
+            // Sub-progress
+            document.getElementById('detail-live-pairs').textContent = p.dataset_pairs || '0';
+            if (e.status === 'distilling' && p.batch_total > 0) {
+                var batchPct = Math.round((p.batch_current / p.batch_total) * 100);
+                document.getElementById('detail-sub-bar').style.width = batchPct + '%';
+                document.getElementById('detail-sub-pct').textContent = batchPct + '%';
+                document.getElementById('detail-sub-label').textContent = 'Batch ' + p.batch_current + '/' + p.batch_total + ' (' + (p.batch_type || '') + ')';
+                document.getElementById('detail-live-batch').textContent = p.batch_current + '/' + p.batch_total;
+
+                if (!detailStartTime && p.batch_current > 0) detailStartTime = Date.now();
+                if (detailStartTime && p.batch_current > detailLastBatch) {
+                    var elapsed = (Date.now() - detailStartTime) / 1000;
+                    var rate = p.batch_current / elapsed;
+                    var remaining = (p.batch_total - p.batch_current) / rate;
+                    if (remaining < 60) document.getElementById('detail-live-eta').textContent = Math.round(remaining) + 's';
+                    else if (remaining < 3600) document.getElementById('detail-live-eta').textContent = Math.round(remaining / 60) + 'm';
+                    else document.getElementById('detail-live-eta').textContent = Math.round(remaining / 3600) + 'h ' + Math.round((remaining % 3600) / 60) + 'm';
+                }
+                detailLastBatch = p.batch_current;
+            } else {
+                document.getElementById('detail-sub-label').textContent = '-';
+                document.getElementById('detail-sub-pct').textContent = '-';
+                document.getElementById('detail-live-batch').textContent = '-';
+            }
+
+            // Stop polling when done or failed
+            if (e.status === 'ready' || e.status === 'failed') {
+                clearInterval(detailTimer);
+                document.getElementById('detail-progress-bar').classList.remove('progress-bar-animated');
+                if (e.status === 'ready') document.getElementById('detail-progress-bar').classList.add('bg-success');
+                if (e.status === 'failed') document.getElementById('detail-progress-bar').classList.add('bg-danger');
+            }
+        } catch (err) { console.error('Detail progress error:', err); }
+    }
+
+    async function loadDetailLogs() {
+        if (!currentExpertId) return;
+        var step = document.getElementById('detail-log-step').value;
+        var url = '/api/experts/' + currentExpertId + '/logs' + (step ? '?step=' + step : '');
+        try {
+            var res = await fetch(url);
+            var data = await res.json();
+            var logEl = document.getElementById('detail-log-output');
+            logEl.textContent = (data.lines || []).join('\n');
+            logEl.scrollTop = logEl.scrollHeight;
+            var sel = document.getElementById('detail-log-step');
+            var currentVal = sel.value;
+            var steps = data.available_steps || [];
+            sel.innerHTML = '<option value="">Current</option>' +
+                steps.map(function(s) { return '<option value="' + s + '"' + (s === currentVal ? ' selected' : '') + '>' + s + '</option>'; }).join('');
+        } catch (err) { console.error('Failed to load logs:', err); }
+    }
+
+    async function retryDistillation() {
+        if (!currentExpertId) return;
+        var fromStep = document.getElementById('retry-step').value;
+        var modelSize = document.querySelector('input[name="retry-size"]:checked')?.value || '';
+        var baseModel = document.getElementById('retry-base-model').value.trim();
+
+        var btn = document.getElementById('retry-btn');
+        btn.disabled = true;
+        btn.textContent = 'Retrying...';
+
+        try {
+            var body = { from_step: fromStep };
+            if (baseModel) body.base_model = baseModel;
+            if (modelSize) body.model_size = modelSize;
+
+            var res = await fetch('/api/experts/' + currentExpertId + '/retry', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            var data = await res.json();
+            if (!res.ok) {
+                alert('Retry failed: ' + (data.error || 'Unknown error'));
+                btn.disabled = false;
+                btn.textContent = 'Retry';
+                return;
+            }
+
+            // Switch to progress polling — reload detail view
+            document.getElementById('detail-retry-card').classList.add('d-none');
+            loadExpertDetail(currentExpertId);
+        } catch (err) {
+            alert('Retry failed: ' + err.message);
+            btn.disabled = false;
+            btn.textContent = 'Retry';
+        }
+    }
+
+    function addSourceRow() {
+        var list = document.getElementById('sources-list');
+        var row = document.createElement('div');
+        row.className = 'input-group mb-2 source-row';
+        row.innerHTML = '<input type="text" class="form-control source-input" placeholder="/path/to/another/project" autocomplete="off">' +
+            '<button class="btn btn-outline-secondary" type="button" onclick="detectSourceRow(this)">Detect</button>' +
+            '<button class="btn btn-outline-danger" type="button" onclick="removeSourceRow(this)">X</button>';
+        list.appendChild(row);
+    }
+
+    function removeSourceRow(btn) {
+        btn.closest('.source-row').remove();
+    }
+
+    function getSourceValues() {
+        var inputs = document.querySelectorAll('.source-input');
+        var sources = [];
+        inputs.forEach(function(el) {
+            var v = el.value.trim();
+            if (v) sources.push(v);
+        });
+        return sources;
+    }
+
+    async function detectSourceRow(btn) {
+        var input = btn.closest('.source-row').querySelector('.source-input');
+        var source = input.value.trim();
+        if (!source) return;
+        btn.disabled = true; btn.textContent = 'Detecting...';
+        try {
+            var res = await fetch('/api/detect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source: source }) });
+            var data = await res.json();
+            document.getElementById('detect-result').classList.remove('d-none');
+            document.getElementById('detect-language').textContent = data.language || 'Unknown';
+            var frameworks = (data.frameworks || []).join(', ');
+            document.getElementById('detect-frameworks').textContent = frameworks ? '(' + frameworks + ')' : '';
+            var conf = data.confidence || 0;
+            document.getElementById('detect-confidence').textContent = conf > 0 ? (conf * 100).toFixed(0) + '% confidence' : '';
+            document.getElementById('detect-note').textContent = data.note || '';
+            if (data.language && data.language !== 'auto') document.getElementById('language-select').value = data.language;
+        } catch (err) { alert('Detection failed: ' + err.message); }
+        finally { btn.disabled = false; btn.textContent = 'Detect'; }
+    }
+
+    function wizardNext(step) {
+        if (step === 2) {
+            var sources = getSourceValues();
+            if (sources.length === 0) { alert('Please enter at least one source repository URL or local path.'); return; }
+            var nameInput = document.getElementById('expert-name');
+            if (!nameInput.value) {
+                var match = sources[0].match(/([^\/]+?)(?:\.git)?$/);
+                nameInput.value = match ? match[1] : 'expert';
+            }
+        }
+        document.querySelectorAll('.wizard-step').forEach(function(el) { el.classList.remove('active'); });
+        document.getElementById('step-' + step).classList.add('active');
+        for (var i = 1; i <= 4; i++) {
+            var dot = document.getElementById('dot-' + i);
+            dot.classList.remove('active', 'completed');
+            if (i < step) dot.classList.add('completed');
+            else if (i === step) dot.classList.add('active');
+            if (i < 4) {
+                var line = document.getElementById('line-' + i);
+                if (i < step) line.classList.add('completed');
+                else line.classList.remove('completed');
+            }
+        }
+        wizardStep = step;
+        if (step === 2) updateEstimates();
+    }
+
+    function selectModelSize(size, el) {
+        selectedModelSize = size;
+        document.querySelectorAll('.model-size-card').forEach(function(c) { c.classList.remove('selected'); });
+        el.classList.add('selected');
+        el.querySelector('input[type="radio"]').checked = true;
+        updateEstimates();
+    }
+
+    function updateEstimates() {
+        var samples = parseInt(document.getElementById('target-samples').value);
+        document.getElementById('samples-display').textContent = samples;
+        document.getElementById('est-cost').textContent = '$' + (samples / 1000 * 5).toFixed(2);
+        document.getElementById('est-time').textContent = '~' + Math.round(samples / 1000 * 45) + ' min distill + ~60 min train';
+    }
+
+    async function startDistillation() {
+        var sources = getSourceValues();
+        var name = document.getElementById('expert-name').value.trim();
+        var language = document.getElementById('language-select').value;
+        var targetSamples = parseInt(document.getElementById('target-samples').value);
+        var customBaseModel = (document.getElementById('custom-base-model').value || '').trim();
+        try {
+            var payload = { sources: sources, name: name, language: language, model_size: selectedModelSize, target_samples: targetSamples };
+            if (customBaseModel) payload.base_model = customBaseModel;
+            var res = await fetch('/api/experts', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload) });
+            var data = await res.json();
+            if (data.error) { alert('Error: ' + data.error); return; }
+            currentExpertId = data.expert.id;
+            wizardNext(3);
+            pollProgress();
+        } catch (err) { alert('Failed to start distillation: ' + err.message); }
+    }
+
+    var distillStartTime = null;
+    var lastBatchCount = 0;
+
+    function pollProgress() {
+        clearInterval(logTimer);
+        distillStartTime = null;
+        lastBatchCount = 0;
+        logTimer = setInterval(async function() {
+            if (!currentExpertId) return;
+            try {
+                var [expertRes, logsRes, progressRes] = await Promise.all([
+                    fetch('/api/experts/' + currentExpertId),
+                    fetch('/api/experts/' + currentExpertId + '/logs'),
+                    fetch('/api/experts/' + currentExpertId + '/progress')
+                ]);
+                var expertData = await expertRes.json();
+                var logsData = await logsRes.json();
+                var progressData = await progressRes.json();
+                var e = expertData.expert;
+                var p = progressData.progress || {};
+                if (!e) return;
+
+                var stepOrder = ['pending','cloning','detecting','extracting','distilling','training','exporting','ready'];
+                var stepIdx = stepOrder.indexOf(e.status);
+                var pct = Math.min(100, Math.round((stepIdx / (stepOrder.length - 1)) * 100));
+                document.getElementById('progress-bar').style.width = pct + '%';
+                document.getElementById('progress-percent').textContent = pct + '%';
+                document.getElementById('progress-step-label').textContent = statusLabel(e.status);
+                document.getElementById('metric-samples').textContent = e.samples_count || '0';
+                document.getElementById('metric-loss').textContent = e.training_loss > 0 ? Number(e.training_loss).toFixed(4) : '-';
+
+                // Real-time dataset pair count from progress endpoint
+                var pairCount = p.dataset_pairs || e.dataset_count || 0;
+                document.getElementById('metric-dataset').textContent = pairCount;
+
+                // Sub-progress for distilling/training
+                var subWrap = document.getElementById('sub-progress-wrap');
+                var subBar = document.getElementById('sub-progress-bar');
+                var subLabel = document.getElementById('sub-progress-label');
+                var subPct = document.getElementById('sub-progress-percent');
+
+                if (e.status === 'distilling' && p.batch_total > 0) {
+                    subWrap.classList.remove('d-none');
+                    var batchPct = Math.round((p.batch_current / p.batch_total) * 100);
+                    subBar.style.width = batchPct + '%';
+                    subPct.textContent = batchPct + '%';
+                    subLabel.textContent = 'Batch ' + p.batch_current + '/' + p.batch_total + ' (' + (p.batch_type || '') + ')';
+
+                    // ETA calculation
+                    if (!distillStartTime && p.batch_current > 0) distillStartTime = Date.now();
+                    if (distillStartTime && p.batch_current > lastBatchCount) {
+                        var elapsed = (Date.now() - distillStartTime) / 1000;
+                        var rate = p.batch_current / elapsed;
+                        var remaining = (p.batch_total - p.batch_current) / rate;
+                        if (remaining < 60) document.getElementById('metric-eta').textContent = Math.round(remaining) + 's';
+                        else if (remaining < 3600) document.getElementById('metric-eta').textContent = Math.round(remaining / 60) + 'm';
+                        else document.getElementById('metric-eta').textContent = Math.round(remaining / 3600) + 'h ' + Math.round((remaining % 3600) / 60) + 'm';
+                    }
+                    lastBatchCount = p.batch_current;
+                } else if (e.status === 'training' && p.current_epoch) {
+                    subWrap.classList.remove('d-none');
+                    var epochs = parseInt(e.config?.epochs || 3);
+                    var trainPct = Math.round((p.current_epoch / epochs) * 100);
+                    subBar.style.width = trainPct + '%';
+                    subBar.className = 'progress-bar bg-warning';
+                    subPct.textContent = trainPct + '%';
+                    subLabel.textContent = 'Epoch ' + p.current_epoch.toFixed(1) + '/' + epochs + (p.current_loss ? ' (loss: ' + p.current_loss.toFixed(4) + ')' : '');
+                } else {
+                    subWrap.classList.add('d-none');
+                }
+
+                var logEl = document.getElementById('progress-log');
+                logEl.textContent = (logsData.lines || []).join('\n');
+                logEl.scrollTop = logEl.scrollHeight;
+                if (e.status === 'ready') { clearInterval(logTimer); showComplete(e); }
+                else if (e.status === 'failed') {
+                    clearInterval(logTimer);
+                    document.getElementById('progress-bar').classList.remove('progress-bar-animated');
+                    document.getElementById('progress-bar').classList.add('bg-danger');
+                    document.getElementById('progress-step-label').textContent = 'Failed: ' + (e.error || 'Unknown error');
+                }
+            } catch (err) { console.error('Poll error:', err); }
+        }, 2000);
+    }
+
+    function showComplete(expert) {
+        wizardNext(4);
+        document.getElementById('complete-name').textContent = expert.name;
+        document.getElementById('complete-language').textContent = expert.language || '-';
+        document.getElementById('complete-model-size').textContent = expert.model_size || '-';
+        document.getElementById('complete-gguf').textContent = expert.gguf_path || '-';
+        document.getElementById('complete-gguf-size').textContent = expert.gguf_size > 0 ? formatBytes(expert.gguf_size) : '-';
+        document.getElementById('complete-loss').textContent = expert.training_loss > 0 ? Number(expert.training_loss).toFixed(4) : '-';
+        var modelName = 'halfbaked-' + expert.name.toLowerCase().replace(/[^a-z0-9]/g, '-');
+        document.getElementById('cmd-test').value = 'ollama run ' + modelName + ' "Write a hello world"';
+        document.getElementById('cmd-halfbaked').value = 'halfbaked generate --model=' + modelName + ' "Your task"';
+    }
+
+    function resetWizard() {
+        // Reset multi-source list to single empty row
+        var list = document.getElementById('sources-list');
+        list.innerHTML = '<div class="input-group mb-2 source-row">' +
+            '<input type="text" class="form-control source-input" placeholder="https://github.com/user/repo.git or /path/to/project" autocomplete="off">' +
+            '<button class="btn btn-outline-secondary" type="button" onclick="detectSourceRow(this)">Detect</button>' +
+            '</div>';
+        document.getElementById('expert-name').value = '';
+        document.getElementById('language-select').value = 'auto';
+        document.getElementById('target-samples').value = 1000;
+        document.getElementById('detect-result').classList.add('d-none');
+        document.getElementById('custom-base-model').value = '';
+        document.querySelectorAll('.model-size-card').forEach(function(c) { c.classList.remove('selected'); });
+        // Select the 7B card (4th one, 0-indexed)
+        var cards = document.querySelectorAll('.model-size-card');
+        cards.forEach(function(c) {
+            if (c.querySelector('input[value="7B"]')) { c.classList.add('selected'); c.querySelector('input').checked = true; }
+        });
+        selectedModelSize = '7B';
+        currentExpertId = null;
+        clearInterval(logTimer);
+        document.getElementById('progress-bar').style.width = '0%';
+        document.getElementById('progress-bar').className = 'progress-bar progress-bar-striped progress-bar-animated';
+        updateEstimates();
+        wizardNext(1);
+    }
+
+    function statusLabel(status) {
+        var labels = { pending:'Pending', cloning:'Cloning Repository', detecting:'Detecting Language', extracting:'Extracting Code', distilling:'Generating Dataset', training:'Training Model', exporting:'Exporting GGUF', ready:'Ready', failed:'Failed' };
+        return labels[status] || status;
+    }
+
+    function formatBytes(bytes) {
+        if (!bytes || bytes === 0) return '0 B';
+        bytes = parseInt(bytes);
+        var k = 1024, sizes = ['B','KB','MB','GB'];
+        var i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    }
+
+    function esc(str) {
+        var div = document.createElement('div');
+        div.textContent = str || '';
+        return div.innerHTML;
+    }
+
+    function copyCmd(id) {
+        var input = document.getElementById(id);
+        navigator.clipboard.writeText(input.value).then(function() {
+            var btn = input.nextElementSibling;
+            var orig = btn.textContent;
+            btn.textContent = 'Copied!';
+            setTimeout(function() { btn.textContent = orig; }, 1500);
+        });
+    }
+
+    // --- Settings ---
+    async function loadSettings() {
+        try {
+            var res = await fetch('/api/settings');
+            var data = await res.json();
+            var s = data.settings || {};
+            document.getElementById('setting-distill-provider').value = s.distill_provider || 'anthropic';
+            document.getElementById('setting-distill-model').value = s.distill_model || '';
+            document.getElementById('setting-api-base').value = s.api_base || '';
+            document.getElementById('setting-openai-key').value = s.openai_api_key || '';
+            document.getElementById('setting-api-key').value = s.anthropic_api_key || '';
+            document.getElementById('setting-ollama-host').value = s.ollama_host || '';
+            document.getElementById('setting-ollama-port').value = s.ollama_port || '';
+            document.getElementById('setting-python-path').value = s.python_path || '';
+            toggleProviderFields();
+            var keyStatus = document.getElementById('key-status');
+            if (s.anthropic_api_key_masked) {
+                keyStatus.textContent = 'Saved: ' + s.anthropic_api_key_masked;
+                keyStatus.className = 'text-success';
+            } else {
+                keyStatus.textContent = 'Not set';
+                keyStatus.className = 'text-warning';
+            }
+        } catch (err) { console.error('Failed to load settings:', err); }
+    }
+
+    async function saveSettings() {
+        var payload = {};
+        payload.distill_provider = document.getElementById('setting-distill-provider').value;
+        var distillModel = document.getElementById('setting-distill-model').value.trim();
+        payload.distill_model = distillModel;
+        var apiBase = document.getElementById('setting-api-base').value.trim();
+        if (apiBase) payload.api_base = apiBase;
+        var openaiKey = document.getElementById('setting-openai-key').value.trim();
+        if (openaiKey) payload.openai_api_key = openaiKey;
+        var key = document.getElementById('setting-api-key').value.trim();
+        if (key) payload.anthropic_api_key = key;
+        var host = document.getElementById('setting-ollama-host').value.trim();
+        if (host) payload.ollama_host = host;
+        var port = document.getElementById('setting-ollama-port').value.trim();
+        if (port) payload.ollama_port = port;
+        var pyPath = document.getElementById('setting-python-path').value.trim();
+        payload.python_path = pyPath;
+        try {
+            await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            var msg = document.getElementById('settings-saved');
+            msg.classList.remove('d-none');
+            setTimeout(function() { msg.classList.add('d-none'); }, 2000);
+            loadSettings();
+        } catch (err) { alert('Failed to save settings: ' + err.message); }
+    }
+
+    function toggleProviderFields() {
+        var provider = document.getElementById('setting-distill-provider').value;
+        var anthropicEl = document.getElementById('anthropic-fields');
+        var openaiEl = document.getElementById('openai-fields');
+        if (provider === 'anthropic') {
+            anthropicEl.classList.remove('d-none');
+            openaiEl.classList.add('d-none');
+        } else {
+            anthropicEl.classList.add('d-none');
+            openaiEl.classList.remove('d-none');
+        }
+        var modelInput = document.getElementById('setting-distill-model');
+        modelInput.placeholder = provider === 'anthropic' ? 'Default: claude-sonnet-4-20250514' : 'Default: kimi2.5:cloud (or qwen3:32b, gpt-4o)';
+    }
+
+    function toggleKeyVisibility() {
+        var input = document.getElementById('setting-api-key');
+        var btn = input.nextElementSibling;
+        if (input.type === 'password') { input.type = 'text'; btn.textContent = 'Hide'; }
+        else { input.type = 'password'; btn.textContent = 'Show'; }
+    }
+
+    // Load settings when modal opens
+    document.getElementById('settingsModal').addEventListener('show.bs.modal', loadSettings);
+
+    async function importExpert() {
+        var name = document.getElementById('import-name').value.trim();
+        if (!name) {
+            document.getElementById('import-error').textContent = 'Name is required.';
+            document.getElementById('import-error').classList.remove('d-none');
+            return;
+        }
+        document.getElementById('import-error').classList.add('d-none');
+        document.getElementById('import-success').classList.add('d-none');
+
+        var body = {
+            name: name,
+            ollama_model: document.getElementById('import-ollama').value.trim(),
+            gguf_path: document.getElementById('import-gguf').value.trim(),
+            source: document.getElementById('import-source').value.trim() || 'imported',
+            language: document.getElementById('import-language').value,
+            framework: document.getElementById('import-framework').value.trim(),
+            model_size: document.getElementById('import-model-size').value,
+            base_model: document.getElementById('import-base-model').value.trim(),
+            training_loss: parseFloat(document.getElementById('import-loss').value) || 0,
+            samples_count: parseInt(document.getElementById('import-samples').value) || 0,
+            dataset_count: parseInt(document.getElementById('import-dataset').value) || 0,
+        };
+
+        if (!body.ollama_model && !body.gguf_path) {
+            document.getElementById('import-error').textContent = 'Provide either an Ollama model name or a GGUF path.';
+            document.getElementById('import-error').classList.remove('d-none');
+            return;
+        }
+
+        try {
+            var res = await fetch('/api/experts/import', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(body)
+            });
+            var data = await res.json();
+            if (data.error) {
+                document.getElementById('import-error').textContent = data.error;
+                document.getElementById('import-error').classList.remove('d-none');
+                return;
+            }
+            document.getElementById('import-success').textContent = 'Imported: ' + data.expert.name + ' (' + data.expert.id + ')';
+            document.getElementById('import-success').classList.remove('d-none');
+            // Refresh list and close modal after a moment
+            loadExperts();
+            setTimeout(function() {
+                bootstrap.Modal.getInstance(document.getElementById('importModal')).hide();
+                // Reset form
+                ['import-name','import-ollama','import-gguf','import-source','import-framework',
+                 'import-loss','import-samples','import-dataset','import-base-model'].forEach(function(id) {
+                    document.getElementById(id).value = '';
+                });
+                document.getElementById('import-language').value = '';
+                document.getElementById('import-model-size').value = '7b';
+                document.getElementById('import-success').classList.add('d-none');
+            }, 1500);
+        } catch (err) {
+            document.getElementById('import-error').textContent = 'Import failed: ' + err.message;
+            document.getElementById('import-error').classList.remove('d-none');
+        }
+    }
+
+    showView('list');
+    </script>
+</body>
+</html>

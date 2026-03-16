@@ -1,0 +1,1568 @@
+#!/usr/bin/env php
+<?php
+/**
+ * HalfBaked CLI — codebase-aware code generation with voidlux-coder.
+ *
+ * Usage:
+ *   halfbaked generate "Add a shipping rate endpoint" --path=/path/to/project
+ *   halfbaked generate "Refactor the OrderService to use events" --path=. --files=services/Orders/
+ *   halfbaked generate "Write tests for UserController" --context=services/Auth/UserController.php
+ *   halfbaked models                    # list available Ollama models
+ *   halfbaked check                     # verify voidlux-coder is available
+ *
+ * Environment:
+ *   HALFBAKED_MODEL   Model name (default: voidlux-coder)
+ *   HALFBAKED_HOST    Ollama host (default: 127.0.0.1)
+ *   HALFBAKED_PORT    Ollama port (default: 11434)
+ */
+
+declare(strict_types=1);
+
+// Find autoloader
+$autoloadPaths = [
+    __DIR__ . '/../vendor/autoload.php',           // Running from halfbaked repo
+    __DIR__ . '/../../../autoload.php',             // Running as a composer dependency
+];
+
+foreach ($autoloadPaths as $path) {
+    if (file_exists($path)) {
+        require $path;
+        break;
+    }
+}
+
+use HalfBaked\Ollama\OllamaClient;
+
+// --- Config ---
+$model = getenv('HALFBAKED_MODEL') ?: 'voidlux-coder';
+$host = getenv('HALFBAKED_HOST') ?: '127.0.0.1';
+$port = (int)(getenv('HALFBAKED_PORT') ?: 11434);
+
+$ollama = new OllamaClient($host, $port, timeout: 300);
+
+// --- Parse args ---
+$args = $argv;
+array_shift($args); // remove script name
+$command = array_shift($args) ?? 'help';
+
+// Parse --flags
+$flags = [];
+$positional = [];
+foreach ($args as $arg) {
+    if (str_starts_with($arg, '--')) {
+        $parts = explode('=', substr($arg, 2), 2);
+        $flags[$parts[0]] = $parts[1] ?? true;
+    } else {
+        $positional[] = $arg;
+    }
+}
+
+if (isset($flags['model'])) $model = $flags['model'];
+if (isset($flags['host'])) $host = $flags['host'];
+if (isset($flags['port'])) $port = (int)$flags['port'];
+
+match ($command) {
+    'generate', 'gen', 'g' => cmdGenerate($ollama, $model, $host, $port, $positional, $flags),
+    'build', 'b' => cmdBuild($positional, $flags),
+    'distill' => cmdDistill($positional, $flags),
+    'models', 'list' => cmdModels($ollama),
+    'check' => cmdCheck($ollama, $model),
+    'scan' => cmdScan($flags),
+    default => cmdHelp(),
+};
+
+// =====================================================================
+// Commands
+// =====================================================================
+
+function cmdGenerate(OllamaClient $ollama, string $model, string $host, int $port, array $positional, array $flags): void
+{
+    $task = implode(' ', $positional);
+    if (empty($task)) {
+        fwrite(STDERR, "Error: provide a task description\n");
+        fwrite(STDERR, "Usage: halfbaked generate \"Add a user login endpoint\"\n");
+        exit(1);
+    }
+
+    $projectPath = $flags['path'] ?? getcwd();
+    $projectPath = realpath($projectPath) ?: $projectPath;
+
+    // Gather context files
+    $contextFiles = [];
+
+    // Explicit --context files
+    if (!empty($flags['context'])) {
+        foreach (explode(',', $flags['context']) as $f) {
+            $full = realpath($projectPath . '/' . trim($f)) ?: trim($f);
+            if (is_file($full)) {
+                $contextFiles[] = $full;
+            }
+        }
+    }
+
+    // Explicit --files directories
+    if (!empty($flags['files'])) {
+        foreach (explode(',', $flags['files']) as $dir) {
+            $full = realpath($projectPath . '/' . trim($dir)) ?: trim($dir);
+            if (is_dir($full)) {
+                $found = scanPhpFiles($full, 10);
+                $contextFiles = array_merge($contextFiles, $found);
+            } elseif (is_file($full)) {
+                $contextFiles[] = $full;
+            }
+        }
+    }
+
+    // Auto-discover relevant files if no explicit context given
+    if (empty($contextFiles)) {
+        fwrite(STDERR, "Scanning {$projectPath} for relevant files...\n");
+        $contextFiles = autoDiscover($projectPath, $task);
+    }
+
+    // Deduplicate
+    $contextFiles = array_unique($contextFiles);
+
+    // Read file contents (limit total context to ~16K chars to stay in window)
+    $maxContextChars = (int)($flags['max-context'] ?? 16000);
+    $contextBlock = buildContext($contextFiles, $projectPath, $maxContextChars);
+
+    // Build the prompt
+    $fileCount = count($contextFiles);
+    fwrite(STDERR, "Context: {$fileCount} files, " . strlen($contextBlock) . " chars\n");
+    fwrite(STDERR, "Model: {$model}\n");
+    fwrite(STDERR, "Generating...\n");
+
+    $system = <<<'SYS'
+You are a senior PHP developer. You write clean, production-ready code following PSR-12 standards.
+When given existing codebase files as context, you MUST follow the same patterns, naming conventions,
+frameworks, and architectural style you see in those files.
+
+Output ONLY the PHP code. No explanations, no markdown fences, no commentary.
+Start with <?php and write complete, working code.
+SYS;
+
+    $prompt = "## Task\n\n{$task}\n\n";
+    if (!empty($contextBlock)) {
+        $prompt .= "## Existing Codebase (follow these patterns)\n\n{$contextBlock}\n\n";
+    }
+    $prompt .= "## Generate\n\nWrite the PHP code to accomplish the task above. Follow the exact patterns from the existing codebase.";
+
+    $backend = $flags['backend'] ?? 'ollama';
+    $ggufPath = $flags['gguf'] ?? '';
+    $llamaCli = $flags['llama-cli'] ?? '';
+
+    if ($backend === 'gguf' || !empty($ggufPath)) {
+        generateViaGguf($system, $prompt, $ggufPath, $llamaCli, $flags);
+    } else {
+        generateViaOllama($system, $prompt, $model, $host, $port, $flags);
+    }
+}
+
+/**
+ * Generate via Ollama HTTP API.
+ */
+function generateViaOllama(string $system, string $prompt, string $model, string $host, int $port, array $flags): void
+{
+    $ch = curl_init("http://{$host}:{$port}/api/chat");
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => json_encode([
+            'model' => $model,
+            'messages' => [
+                ['role' => 'system', 'content' => $system],
+                ['role' => 'user', 'content' => $prompt],
+            ],
+            'stream' => false,
+            'options' => [
+                'temperature' => 0.2,
+                'num_predict' => (int)($flags['max-tokens'] ?? 2048),
+                'num_ctx' => (int)($flags['num-ctx'] ?? 8192),
+            ],
+        ]),
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+        CURLOPT_TIMEOUT => 300,
+    ]);
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $error = curl_error($ch);
+    curl_close($ch);
+
+    if ($error || $httpCode !== 200) {
+        fwrite(STDERR, "Error: " . ($error ?: "HTTP {$httpCode}") . "\n");
+        if ($response) fwrite(STDERR, substr($response, 0, 500) . "\n");
+        exit(1);
+    }
+
+    $data = json_decode($response, true);
+    $code = $data['message']['content'] ?? '';
+
+    echo $code . "\n";
+
+    $evalDuration = ($data['eval_duration'] ?? 0) / 1_000_000_000;
+    $tokens = $data['eval_count'] ?? 0;
+    fwrite(STDERR, sprintf("\nDone: %d tokens in %.1fs (%.0f tok/s)\n",
+        $tokens, $evalDuration, $evalDuration > 0 ? $tokens / $evalDuration : 0));
+}
+
+/**
+ * Generate via llama-cli directly (no Ollama needed).
+ * Uses the GGUF file and llama.cpp binary.
+ */
+function generateViaGguf(string $system, string $prompt, string $ggufPath, string $llamaCli, array $flags): void
+{
+    // Auto-detect paths
+    $defaultGguf = getenv('HALFBAKED_GGUF') ?: findGgufFile();
+    $defaultCli = getenv('HALFBAKED_LLAMA_CLI') ?: findLlamaCli();
+
+    $gguf = $ggufPath ?: $defaultGguf;
+    $cli = $llamaCli ?: $defaultCli;
+
+    if (!$gguf || !file_exists($gguf)) {
+        fwrite(STDERR, "Error: GGUF file not found. Use --gguf=/path/to/model.gguf or set HALFBAKED_GGUF\n");
+        exit(1);
+    }
+    if (!$cli || !file_exists($cli)) {
+        fwrite(STDERR, "Error: llama-cli not found. Use --llama-cli=/path/to/llama-cli or set HALFBAKED_LLAMA_CLI\n");
+        exit(1);
+    }
+
+    fwrite(STDERR, "Backend: GGUF direct (no Ollama)\n");
+    fwrite(STDERR, "Binary: {$cli}\n");
+    fwrite(STDERR, "Model: {$gguf}\n");
+
+    // Build the Qwen2.5 chat-formatted prompt
+    $fullPrompt = "<|im_start|>system\n{$system}<|im_end|>\n<|im_start|>user\n{$prompt}<|im_end|>\n<|im_start|>assistant\n";
+
+    // Write prompt to temp file (avoids shell escaping issues)
+    $promptFile = tempnam(sys_get_temp_dir(), 'hb-prompt-');
+    file_put_contents($promptFile, $fullPrompt);
+
+    $maxTokens = (int)($flags['max-tokens'] ?? 2048);
+    $ctxSize = (int)($flags['num-ctx'] ?? 8192);
+    $threads = (int)($flags['threads'] ?? 4);
+    $gpuLayers = (int)($flags['gpu-layers'] ?? 99);
+
+    $cmd = sprintf(
+        '%s -m %s --file %s -n %d -c %d -t %d -ngl %d --temp 0.2 --repeat-penalty 1.1 --no-display-prompt 2>/dev/null',
+        escapeshellarg($cli),
+        escapeshellarg($gguf),
+        escapeshellarg($promptFile),
+        $maxTokens,
+        $ctxSize,
+        $threads,
+        $gpuLayers,
+    );
+
+    $startTime = microtime(true);
+    $output = shell_exec($cmd);
+    $elapsed = microtime(true) - $startTime;
+
+    unlink($promptFile);
+
+    if ($output === null) {
+        fwrite(STDERR, "Error: llama-cli execution failed\n");
+        exit(1);
+    }
+
+    // Strip any trailing <|im_end|> token
+    $output = preg_replace('/<\|im_end\|>\s*$/', '', $output);
+
+    echo trim($output) . "\n";
+
+    $words = str_word_count($output);
+    $estTokens = (int)($words * 1.3);
+    fwrite(STDERR, sprintf("\nDone: ~%d tokens in %.1fs\n", $estTokens, $elapsed));
+}
+
+/**
+ * Auto-detect GGUF file in common locations.
+ */
+function findGgufFile(): string
+{
+    $candidates = [
+        __DIR__ . '/../../voidlux/training/output/gguf/voidlux-coder-Q8_0.gguf',
+        getenv('HOME') . '/development/voidlux/training/output/gguf/voidlux-coder-Q8_0.gguf',
+        getcwd() . '/voidlux-coder-Q8_0.gguf',
+    ];
+    foreach ($candidates as $path) {
+        $real = realpath($path);
+        if ($real && file_exists($real)) return $real;
+    }
+    return '';
+}
+
+/**
+ * Auto-detect llama-cli binary.
+ */
+function findLlamaCli(): string
+{
+    // Check PATH first
+    $which = trim(shell_exec('which llama-cli 2>/dev/null') ?: '');
+    if ($which && file_exists($which)) return $which;
+
+    $candidates = [
+        __DIR__ . '/../../voidlux/training/tools/llama.cpp/build/bin/llama-cli',
+        getenv('HOME') . '/development/voidlux/training/tools/llama.cpp/build/bin/llama-cli',
+        '/usr/local/bin/llama-cli',
+    ];
+    foreach ($candidates as $path) {
+        $real = realpath($path);
+        if ($real && file_exists($real)) return $real;
+    }
+    return '';
+}
+
+function cmdModels(OllamaClient $ollama): void
+{
+    echo "Available Ollama models:\n\n";
+    try {
+        $ch = curl_init("http://127.0.0.1:11434/api/tags");
+        curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 5]);
+        $body = curl_exec($ch);
+        curl_close($ch);
+
+        $data = json_decode($body ?: '{}', true);
+        foreach ($data['models'] ?? [] as $m) {
+            $size = round(($m['size'] ?? 0) / 1073741824, 1);
+            $family = $m['details']['family'] ?? '?';
+            $quant = $m['details']['quantization_level'] ?? '?';
+            printf("  %-30s %5.1fGB  %-10s %s\n", $m['name'], $size, $family, $quant);
+        }
+    } catch (\Throwable $e) {
+        fwrite(STDERR, "Cannot connect to Ollama: {$e->getMessage()}\n");
+        exit(1);
+    }
+}
+
+function cmdCheck(OllamaClient $ollama, string $model): void
+{
+    echo "Checking {$model}... ";
+    if ($ollama->isAvailable($model)) {
+        echo "OK\n";
+    } else {
+        echo "NOT FOUND\n";
+        echo "Run: ollama pull {$model}\n";
+        exit(1);
+    }
+}
+
+function cmdScan(array $flags): void
+{
+    $path = realpath($flags['path'] ?? getcwd()) ?: getcwd();
+    echo "PHP files in {$path}:\n\n";
+    $files = scanPhpFiles($path, 50);
+    foreach ($files as $f) {
+        $rel = str_replace($path . '/', '', $f);
+        $lines = count(file($f));
+        printf("  %-60s %5d lines\n", $rel, $lines);
+    }
+    echo "\nTotal: " . count($files) . " files\n";
+}
+
+// =====================================================================
+// Build Command — Multi-Expert Feature Builder
+// =====================================================================
+
+function cmdBuild(array $positional, array $flags): void
+{
+    $halfbakedRoot = dirname(__DIR__);
+    $dataDir = $halfbakedRoot . '/data';
+    $publicDir = $halfbakedRoot . '/public';
+    $dbPath = $flags['db-path'] ?? $dataDir . '/builder.db';
+
+    if (!is_dir($dataDir)) {
+        mkdir($dataDir, 0755, true);
+    }
+
+    $subCommand = $positional[0] ?? '';
+
+    // If first positional arg is not a known subcommand, treat it as a feature description
+    $knownSubs = ['serve', 'list', 'ls', 'status', 'run', 'help'];
+    if ($subCommand !== '' && !in_array($subCommand, $knownSubs, true)) {
+        // Inline build: "halfbaked build 'Add product CRUD' --path=./project"
+        buildCreate($dbPath, $positional, $flags, $halfbakedRoot);
+        return;
+    }
+
+    match ($subCommand) {
+        'serve' => buildServe($flags, $publicDir, $dataDir),
+        'list', 'ls' => buildList($dbPath),
+        'status' => buildStatus($dbPath, $positional),
+        'run' => buildRun($dbPath, $positional, $flags, $halfbakedRoot),
+        default => buildHelp(),
+    };
+}
+
+function buildServe(array $flags, string $publicDir, string $dataDir): void
+{
+    $host = $flags['host'] ?? '127.0.0.1';
+    $port = (int)($flags['port'] ?? 8585);
+
+    $server = new \HalfBaked\Builder\BuilderServer($host, $port, $publicDir, $dataDir);
+    $server->start();
+}
+
+function buildCreate(string $dbPath, array $positional, array $flags, string $halfbakedRoot): void
+{
+    $task = implode(' ', $positional);
+    if (empty($task)) {
+        fwrite(STDERR, "Error: provide a feature description\n");
+        fwrite(STDERR, "Usage: halfbaked build \"Add user authentication\" --path=/my/project\n");
+        exit(1);
+    }
+
+    $projectPath = $flags['path'] ?? getcwd();
+    $projectPath = realpath($projectPath) ?: $projectPath;
+    if (!is_dir($projectPath)) {
+        fwrite(STDERR, "Error: project path not found: {$projectPath}\n");
+        exit(1);
+    }
+
+    $decomposer = $flags['decomposer'] ?? 'anthropic';
+    $decomposerModel = $flags['decomposer-model'] ?? ($decomposer === 'anthropic' ? 'claude-sonnet-4-20250514' : '');
+    $apiKey = $flags['api-key'] ?? getenv('ANTHROPIC_API_KEY') ?: '';
+    $apiBase = $flags['api-base'] ?? ($decomposer === 'anthropic' ? 'https://api.anthropic.com' : '');
+    $experts = $flags['experts'] ?? '';
+    $dryRun = isset($flags['dry-run']);
+    $outputDir = $flags['output'] ?? '';
+
+    $config = [
+        'decomposer' => $decomposer,
+        'decomposer_model' => $decomposerModel,
+        'api_key' => $apiKey,
+        'api_base' => $apiBase,
+        'experts' => $experts,
+        'dry_run' => $dryRun,
+        'output_dir' => $outputDir,
+    ];
+
+    $registry = new \HalfBaked\Builder\BuildRegistry($dbPath);
+    $buildId = $registry->createBuild($task, $projectPath, $config);
+
+    echo "Build created: {$buildId}\n";
+    echo "Feature: {$task}\n";
+    echo "Project: {$projectPath}\n";
+    echo "Decomposer: {$decomposer} ({$decomposerModel})\n";
+    if ($dryRun) {
+        echo "Mode: Dry run (decompose only)\n";
+    }
+    echo "\n";
+
+    // Run pipeline directly (not background) for CLI experience
+    buildRunPipeline($registry, $buildId, $config, $halfbakedRoot, $dryRun, $dbPath);
+}
+
+function buildRunPipeline(
+    \HalfBaked\Builder\BuildRegistry $registry,
+    string $buildId,
+    array $config,
+    string $halfbakedRoot,
+    bool $dryRun = false,
+    string $dbPath = 'data/builder.db',
+): void {
+    $build = $registry->getBuild($buildId);
+    if (!$build) {
+        fwrite(STDERR, "Build not found: {$buildId}\n");
+        exit(1);
+    }
+
+    // Pull API key from build config, env, or distillery settings
+    $apiKey = $config['api_key'] ?? '';
+    if (empty($apiKey)) {
+        $apiKey = getenv('ANTHROPIC_API_KEY') ?: '';
+    }
+    if (empty($apiKey)) {
+        // Fall back to distillery settings
+        $expertsDbPath = dirname($dbPath) . '/experts.db';
+        if (file_exists($expertsDbPath)) {
+            $expertReg = new \HalfBaked\Distillery\ExpertRegistry($expertsDbPath);
+            $apiKey = $expertReg->getSetting('anthropic_api_key', '');
+        }
+    }
+
+    $input = [
+        'build_id' => $buildId,
+        'task' => $build['task'],
+        'project_path' => $build['project_path'],
+        'db_path' => $dbPath,
+        'decomposer' => $config['decomposer'] ?? 'anthropic',
+        'decomposer_model' => $config['decomposer_model'] ?? '',
+        'api_key' => $apiKey,
+        'api_base' => $config['api_base'] ?? '',
+        'output_dir' => $config['output_dir'] ?? '',
+        'ollama_host' => getenv('HALFBAKED_HOST') ?: '127.0.0.1',
+        'ollama_port' => (int)(getenv('HALFBAKED_PORT') ?: 11434),
+    ];
+
+    // Parse expert overrides — supports dict {"backend":"model"} or CSV "model1,model2"
+    $expertOverrides = [];
+    if (!empty($config['experts'])) {
+        if (is_array($config['experts'])) {
+            // Dict format: {"backend": "model", "frontend": "model", ...}
+            $expertOverrides = $config['experts'];
+        } else {
+            $models = array_map('trim', explode(',', $config['experts']));
+            // Simple mapping: first model = backend, second = frontend
+            if (isset($models[0])) $expertOverrides['backend'] = $models[0];
+            if (isset($models[1])) $expertOverrides['frontend'] = $models[1];
+        }
+    }
+    $input['expert_overrides'] = $expertOverrides;
+
+    // Check if subtasks already exist (skip scan+decompose on re-execute)
+    $existingSubtasks = $registry->getSubtasks($buildId);
+    if (!empty($existingSubtasks)) {
+        echo "=== Resuming: " . count($existingSubtasks) . " subtasks already decomposed ===\n";
+
+        // Recover project context from build config
+        $input['project_context'] = $config['project_context'] ?? '';
+        $input['language'] = $config['language'] ?? 'unknown';
+
+        // If project_path is a git URL, point to the clone
+        if (!empty($config['clone_path']) && is_dir($config['clone_path'])) {
+            $input['project_path'] = $config['clone_path'];
+        }
+
+        $dbSubtasks = $existingSubtasks;
+    } else {
+        // Step 1: Scan
+        echo "=== Step 1: Scan Project ===\n";
+        $step = new \HalfBaked\Builder\Steps\ScanProjectStep();
+        $input = $step->execute($input);
+        echo "Language: " . ($input['language'] ?? 'unknown') . "\n";
+        echo "Context: " . strlen($input['project_context'] ?? '') . " chars\n\n";
+
+        // Step 2: Decompose
+        echo "=== Step 2: Decompose Feature ===\n";
+        $step = new \HalfBaked\Builder\Steps\DecomposeStep();
+        $input = $step->execute($input);
+        echo "Subtasks: " . count($input['subtasks'] ?? []) . "\n";
+
+        $dbSubtasks = $registry->getSubtasks($buildId);
+    }
+
+    // Display subtasks
+    foreach ($dbSubtasks as $st) {
+        $statusIcon = $st['status'] === 'blocked' ? '~' : 'o';
+        $deps = !empty($st['depends_on']) ? ' (deps: ' . implode(', ', $st['depends_on']) . ')' : '';
+        echo "  [{$statusIcon}] {$st['local_id']}: {$st['title']}";
+        echo " [{$st['domain']}] [{$st['complexity']}]{$deps}\n";
+    }
+    echo "\n";
+
+    // Show routing table
+    $router = new \HalfBaked\Builder\ExpertRouter(
+        overrides: $expertOverrides,
+    );
+    echo "Expert routing:\n";
+    foreach ($router->getRoutingTable() as $domain => $model) {
+        echo "  {$domain} => {$model}\n";
+    }
+    echo "\n";
+
+    if ($dryRun) {
+        echo "Dry run complete. Build ID: {$buildId}\n";
+        echo "View details: halfbaked build status {$buildId}\n";
+        return;
+    }
+
+    // Step 3: Execute
+    echo "=== Step 3: Execute Subtasks ===\n";
+    $step = new \HalfBaked\Builder\Steps\ExecuteStep();
+    $input = $step->execute($input);
+    $result = $input['execution_result'] ?? [];
+    echo "\nExecution: {$result['completed']}/{$result['total']} completed, {$result['failed']} failed\n\n";
+
+    // Step 4: Validate (stub)
+    echo "=== Step 4: Validate ===\n";
+    $step = new \HalfBaked\Builder\Steps\ValidateStep();
+    $input = $step->execute($input);
+    echo "\n";
+
+    // Step 5: Assemble
+    echo "=== Step 5: Assemble ===\n";
+    $step = new \HalfBaked\Builder\Steps\AssembleStep();
+    $input = $step->execute($input);
+    $assembly = $input['assembly_result'] ?? [];
+
+    // Print summary
+    $assembler = new \HalfBaked\Builder\ProjectAssembler();
+    echo "\n" . $assembler->summarize($assembly) . "\n";
+
+    echo "\nBuild complete! ID: {$buildId}\n";
+    echo "View details: halfbaked build status {$buildId}\n";
+}
+
+function buildRun(string $dbPath, array $positional, array $flags, string $halfbakedRoot): void
+{
+    $buildId = $positional[1] ?? '';
+    if (empty($buildId)) {
+        fwrite(STDERR, "Usage: halfbaked build run <build-id>\n");
+        exit(1);
+    }
+
+    $registry = new \HalfBaked\Builder\BuildRegistry($dbPath);
+    $build = $registry->getBuild($buildId);
+    if (!$build) {
+        fwrite(STDERR, "Build not found: {$buildId}\n");
+        exit(1);
+    }
+
+    $config = $build['config'] ?? [];
+    $dryRun = $config['dry_run'] ?? false;
+    buildRunPipeline($registry, $buildId, $config, $halfbakedRoot, $dryRun, $dbPath);
+}
+
+function buildList(string $dbPath): void
+{
+    $registry = new \HalfBaked\Builder\BuildRegistry($dbPath);
+    $builds = $registry->listBuilds();
+
+    if (empty($builds)) {
+        echo "No builds found. Create one with: halfbaked build \"Add a feature\" --path=/project\n";
+        return;
+    }
+
+    printf("%-32s  %-40s  %-12s  %s/%s  %s\n",
+        'ID', 'Feature', 'Status', 'Done', 'Total', 'Created');
+    echo str_repeat('-', 120) . "\n";
+
+    foreach ($builds as $b) {
+        printf("%-32s  %-40s  %-12s  %d/%d    %s\n",
+            $b['id'],
+            substr($b['task'], 0, 40),
+            $b['status'],
+            $b['completed_count'],
+            $b['subtask_count'],
+            $b['created_at'],
+        );
+    }
+}
+
+function buildStatus(string $dbPath, array $positional): void
+{
+    $buildId = $positional[1] ?? '';
+    if (empty($buildId)) {
+        fwrite(STDERR, "Usage: halfbaked build status <build-id>\n");
+        exit(1);
+    }
+
+    $registry = new \HalfBaked\Builder\BuildRegistry($dbPath);
+    $build = $registry->getBuild($buildId);
+    if (!$build) {
+        fwrite(STDERR, "Build not found: {$buildId}\n");
+        exit(1);
+    }
+
+    echo "Build: {$build['id']}\n";
+    echo "Feature: {$build['task']}\n";
+    echo "Project: {$build['project_path']}\n";
+    echo "Status: {$build['status']}\n";
+    echo "Decomposer: " . ($build['decomposer'] ?? '-') . " " . ($build['decomposer_model'] ?? '') . "\n";
+    echo "Progress: {$build['completed_count']}/{$build['subtask_count']}\n";
+    if ($build['error']) {
+        echo "Error: {$build['error']}\n";
+    }
+    echo "Created: {$build['created_at']}\n";
+    echo "Updated: {$build['updated_at']}\n";
+
+    $subtasks = $registry->getSubtasks($buildId);
+    if (!empty($subtasks)) {
+        echo "\nSubtasks:\n";
+        foreach ($subtasks as $st) {
+            $icon = match ($st['status']) {
+                'completed' => '+',
+                'failed' => 'x',
+                'generating' => '>',
+                'blocked' => '~',
+                default => 'o',
+            };
+            $deps = !empty($st['depends_on']) ? ' (deps: ' . implode(', ', $st['depends_on']) . ')' : '';
+            $model = $st['expert_model'] ? " [{$st['expert_model']}]" : '';
+            echo "  [{$icon}] {$st['local_id']}: {$st['title']}";
+            echo " [{$st['domain']}]{$model} — {$st['status']}{$deps}\n";
+
+            if ($st['status'] === 'failed' && $st['error']) {
+                echo "      Error: {$st['error']}\n";
+            }
+            if ($st['status'] === 'completed' && $st['files']) {
+                $fileCount = is_array($st['files']) ? count($st['files']) : 0;
+                echo "      Files: {$fileCount} generated\n";
+            }
+        }
+    }
+
+    // Show assembly result if done
+    if ($build['result']) {
+        echo "\nAssembly Result:\n";
+        $result = is_array($build['result']) ? $build['result'] : json_decode($build['result'], true);
+        if ($result) {
+            $assembler = new \HalfBaked\Builder\ProjectAssembler();
+            echo $assembler->summarize($result) . "\n";
+        }
+    }
+}
+
+function buildHelp(): void
+{
+    echo <<<'HELP'
+HalfBaked Builder — multi-expert feature code generation pipeline
+
+Usage:
+  halfbaked build "Add product CRUD" --path=/my/project
+  halfbaked build serve [--port=8585]
+  halfbaked build list
+  halfbaked build status <id>
+
+Build flags:
+  --path=<dir>              Project directory (default: cwd)
+  --decomposer=<provider>   Reasoning provider: anthropic, openai (default: anthropic)
+  --decomposer-model=<name> Model for decomposition (default: claude-sonnet-4-20250514)
+  --api-key=<key>           API key (or set ANTHROPIC_API_KEY env)
+  --api-base=<url>          OpenAI-compatible base URL (for openai provider)
+  --experts=<models>        Comma-separated expert models (e.g. voidlux-coder,bootstrap)
+  --dry-run                 Decompose only, don't generate code
+  --output=<dir>            Output directory (default: project path)
+
+Subcommands:
+  serve [--port=8585]       Start builder web UI
+  list                      Show all builds
+  status <id>               Show build detail + subtask tree
+  run <id>                  Re-run a build pipeline
+
+Examples:
+  halfbaked build "Add user registration" --path=./my-app
+  halfbaked build "Add product search" --path=./shop --dry-run
+  halfbaked build "Create REST API" --path=./api --experts=voidlux-coder,bootstrap
+  halfbaked build serve --port=8585
+  halfbaked build list
+
+HELP;
+}
+
+function cmdDistill(array $positional, array $flags): void
+{
+    $halfbakedRoot = dirname(__DIR__);
+    $dataDir = $halfbakedRoot . '/data';
+    $publicDir = $halfbakedRoot . '/public';
+    $dbPath = $dataDir . '/experts.db';
+
+    if (!is_dir($dataDir)) {
+        mkdir($dataDir, 0755, true);
+    }
+
+    $subCommand = $positional[0] ?? 'help';
+
+    $registry = new \HalfBaked\Distillery\ExpertRegistry($dbPath);
+
+    match ($subCommand) {
+        'serve' => distillServe($registry, $flags, $publicDir, $dataDir),
+        'create' => distillCreate($registry, $positional, $flags, $dataDir),
+        'run' => distillRun($registry, $positional, $flags, $dataDir, $halfbakedRoot),
+        'import' => distillImport($registry, $positional, $flags, $dataDir),
+        'list', 'ls' => distillList($registry),
+        'status' => distillStatus($registry, $positional),
+        'logs' => distillLogs($registry, $positional, $flags, $dataDir),
+        'remove', 'rm' => distillRemove($registry, $positional, $dataDir),
+        default => distillHelp(),
+    };
+}
+
+function distillServe(\HalfBaked\Distillery\ExpertRegistry $registry, array $flags, string $publicDir, string $dataDir): void
+{
+    $host = $flags['host'] ?? '127.0.0.1';
+    $port = (int)($flags['port'] ?? 8585);
+
+    // Use the unified server (serves both Distillery + Builder)
+    $server = new \HalfBaked\Builder\BuilderServer($host, $port, $publicDir, $dataDir);
+    $server->start();
+}
+
+function distillCreate(\HalfBaked\Distillery\ExpertRegistry $registry, array $positional, array $flags, string $dataDir): void
+{
+    $source = $positional[1] ?? '';
+    if (empty($source)) {
+        fwrite(STDERR, "Usage: halfbaked distill create <source> [--name=X] [--language=php] [--target=1000]\n");
+        exit(1);
+    }
+
+    $repo = new \HalfBaked\Distillery\RepoManager();
+    $sourceType = $repo->isGitUrl($source) ? 'git' : 'local';
+    $name = $flags['name'] ?? $repo->getRepoName($source);
+    $modelSize = $flags['model-size'] ?? '7b';
+    $target = (int)($flags['target'] ?? 1000);
+    $language = $flags['language'] ?? null;
+
+    $config = [
+        'language' => $language,
+        'model_size' => $modelSize,
+        'target_examples' => $target,
+    ];
+
+    $id = $registry->create($name, $source, $sourceType, $config);
+    $registry->update($id, ['model_size' => $modelSize]);
+
+    echo "Expert created: {$name} ({$id})\n";
+    echo "Source: {$source} ({$sourceType})\n";
+    echo "Model size: {$modelSize}\n";
+    echo "Target examples: {$target}\n\n";
+
+    // Launch pipeline in background
+    $halfbakedBin = dirname(__DIR__) . '/bin/halfbaked';
+    $logFile = "{$dataDir}/experts/{$id}/launch.log";
+    @mkdir(dirname($logFile), 0755, true);
+    $cmd = sprintf(
+        'php %s distill run %s > %s 2>&1 &',
+        escapeshellarg($halfbakedBin),
+        escapeshellarg($id),
+        escapeshellarg($logFile)
+    );
+    exec($cmd);
+
+    echo "Distillation launched in background.\n";
+    echo "Track progress: halfbaked distill status {$id}\n";
+    echo "View logs:      halfbaked distill logs {$id}\n";
+}
+
+function distillImport(\HalfBaked\Distillery\ExpertRegistry $registry, array $positional, array $flags, string $dataDir): void
+{
+    $name = $positional[1] ?? '';
+    if (empty($name)) {
+        fwrite(STDERR, "Usage: halfbaked distill import <name> [--gguf=/path/to/model.gguf] [--ollama=model-name]\n");
+        fwrite(STDERR, "       halfbaked distill import voidlux-coder --ollama=voidlux-coder --language=php\n");
+        fwrite(STDERR, "       halfbaked distill import my-model --gguf=/path/to/model-Q8_0.gguf --language=python\n\n");
+        fwrite(STDERR, "Flags:\n");
+        fwrite(STDERR, "  --gguf=<path>          Path to GGUF file on disk\n");
+        fwrite(STDERR, "  --ollama=<model>       Ollama model name (if already registered)\n");
+        fwrite(STDERR, "  --source=<url|path>    Original source repo/path\n");
+        fwrite(STDERR, "  --language=<lang>      Language (php, python, javascript, css, etc.)\n");
+        fwrite(STDERR, "  --framework=<name>     Framework(s) (e.g. flightphp,redbeanphp)\n");
+        fwrite(STDERR, "  --model-size=<size>    Base model size: 0.5b, 1.5b, 3b, 7b (default: 7b)\n");
+        fwrite(STDERR, "  --base-model=<hf>      HuggingFace base model ID\n");
+        fwrite(STDERR, "  --samples=<N>          Number of code samples used\n");
+        fwrite(STDERR, "  --dataset=<N>          Number of training pairs used\n");
+        fwrite(STDERR, "  --loss=<float>         Final training loss\n");
+        fwrite(STDERR, "  --system-prompt=<text>  System prompt baked into the model\n");
+        exit(1);
+    }
+
+    $ggufPath = $flags['gguf'] ?? '';
+    $ollamaModel = $flags['ollama'] ?? '';
+    $source = $flags['source'] ?? 'imported';
+    $language = $flags['language'] ?? '';
+    $framework = $flags['framework'] ?? '';
+    $modelSize = $flags['model-size'] ?? '7b';
+    $baseModel = $flags['base-model'] ?? '';
+    $samplesCount = (int)($flags['samples'] ?? 0);
+    $datasetCount = (int)($flags['dataset'] ?? 0);
+    $trainingLoss = (float)($flags['loss'] ?? 0);
+    $systemPrompt = $flags['system-prompt'] ?? '';
+
+    // Resolve GGUF path — check Ollama if not provided directly
+    $ggufSize = 0;
+    if ($ggufPath && file_exists($ggufPath)) {
+        $ggufSize = filesize($ggufPath);
+    } elseif ($ollamaModel) {
+        // Try to get info from Ollama
+        $ch = curl_init("http://127.0.0.1:11434/api/show");
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => json_encode(['name' => $ollamaModel]),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+            CURLOPT_TIMEOUT => 5,
+        ]);
+        $body = curl_exec($ch);
+        curl_close($ch);
+
+        if ($body) {
+            $info = json_decode($body, true) ?: [];
+            if (!$systemPrompt && isset($info['system'])) {
+                $systemPrompt = $info['system'];
+            }
+            // Get model size from Ollama list
+            $ch2 = curl_init("http://127.0.0.1:11434/api/tags");
+            curl_setopt_array($ch2, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 5]);
+            $listBody = curl_exec($ch2);
+            curl_close($ch2);
+            if ($listBody) {
+                $listData = json_decode($listBody, true) ?: [];
+                foreach ($listData['models'] ?? [] as $m) {
+                    if ($m['name'] === $ollamaModel || $m['name'] === $ollamaModel . ':latest') {
+                        $ggufSize = $m['size'] ?? 0;
+                        break;
+                    }
+                }
+            }
+        }
+        $ggufPath = "ollama://{$ollamaModel}";
+    }
+
+    if (!$ggufPath && !$ollamaModel) {
+        fwrite(STDERR, "Error: must provide --gguf or --ollama\n");
+        exit(1);
+    }
+
+    $config = [
+        'model_size' => $modelSize,
+        'base_model' => $baseModel,
+        'system_prompt' => $systemPrompt,
+        'ollama_model' => $ollamaModel,
+        'imported' => true,
+        'imported_at' => date('Y-m-d H:i:s'),
+        'samples_count' => $samplesCount,
+        'dataset_count' => $datasetCount,
+        'training_loss' => $trainingLoss,
+    ];
+
+    $id = $registry->create($name, $source, 'imported', $config);
+    $registry->update($id, [
+        'language' => $language,
+        'framework' => $framework,
+        'model_size' => $modelSize,
+        'samples_count' => $samplesCount,
+        'dataset_count' => $datasetCount,
+        'training_loss' => $trainingLoss,
+        'gguf_path' => $ggufPath,
+        'gguf_size' => $ggufSize,
+    ]);
+    $registry->updateStatus($id, \HalfBaked\Distillery\ExpertStatus::Ready);
+
+    echo "Expert imported: {$name} ({$id})\n";
+    echo "Language:    {$language}\n";
+    echo "Framework:   {$framework}\n";
+    echo "GGUF:        {$ggufPath}\n";
+    echo "GGUF Size:   " . ($ggufSize > 0 ? round($ggufSize / 1073741824, 2) . ' GB' : 'unknown') . "\n";
+    echo "Model Size:  {$modelSize}\n";
+    echo "Samples:     " . ($samplesCount ?: 'unknown') . "\n";
+    echo "Dataset:     " . ($datasetCount ?: 'unknown') . "\n";
+    if ($trainingLoss > 0) {
+        echo "Loss:        " . number_format($trainingLoss, 4) . "\n";
+    }
+    echo "\nStatus: ready\n";
+}
+
+function distillRun(\HalfBaked\Distillery\ExpertRegistry $registry, array $positional, array $flags, string $dataDir, string $halfbakedRoot): void
+{
+    $id = $positional[1] ?? '';
+    if (empty($id)) {
+        fwrite(STDERR, "Usage: halfbaked distill run <expert-id>\n");
+        exit(1);
+    }
+
+    $expert = $registry->get($id);
+    if (!$expert) {
+        fwrite(STDERR, "Expert not found: {$id}\n");
+        exit(1);
+    }
+
+    $workDir = "{$dataDir}/experts/{$id}";
+    if (!is_dir($workDir)) {
+        mkdir($workDir, 0755, true);
+    }
+
+    $config = $expert['config'];
+    $source = $expert['source_url'];
+    $sourceType = $expert['source_type'];
+    $language = $config['language'] ?? null;
+    $targetExamples = $config['target_examples'] ?? $config['target_samples'] ?? 1000;
+    $modelSize = $config['model_size'] ?? '7b';
+
+    $modelMap = [
+        '0.5b' => 'unsloth/Qwen2.5-Coder-0.5B-Instruct',
+        '1.5b' => 'unsloth/Qwen2.5-Coder-1.5B-Instruct',
+        '3b' => 'unsloth/Qwen2.5-Coder-3B-Instruct',
+        '7b' => 'unsloth/Qwen2.5-Coder-7B-Instruct',
+        '9b' => 'unsloth/Qwen3.5-9B',
+        '14b' => 'unsloth/Qwen2.5-Coder-14B-Instruct',
+    ];
+
+    // Custom base_model from config overrides size-based selection
+    $customBaseModel = trim($config['base_model'] ?? '');
+    if ($customBaseModel && !isset($modelMap[strtolower($customBaseModel)])) {
+        // It's a full HF model ID, use directly
+        $baseModel = $customBaseModel;
+    } else {
+        $baseModel = $modelMap[strtolower($modelSize)] ?? $modelMap['7b'];
+    }
+
+    // --from-step: resume from a specific step, skipping earlier ones
+    $fromStep = $flags['from-step'] ?? '';
+    // --base-model: override the base model for retry
+    $baseModelOverride = $flags['base-model'] ?? '';
+    if ($baseModelOverride) {
+        $baseModel = $baseModelOverride;
+        // Update config so the override is persisted
+        $config['base_model'] = $baseModel;
+        $registry->update($id, ['config' => array_merge($registry->get($id)['config'] ?? [], ['base_model' => $baseModel])]);
+    }
+
+    // Run steps individually with status updates between each
+    $steps = [
+        ['name' => 'clone-repo',        'class' => \HalfBaked\Distillery\Steps\CloneRepoStep::class,        'status' => \HalfBaked\Distillery\ExpertStatus::Cloning],
+        ['name' => 'detect-language',    'class' => \HalfBaked\Distillery\Steps\DetectLanguageStep::class,    'status' => \HalfBaked\Distillery\ExpertStatus::Detecting],
+        ['name' => 'extract-code',       'class' => \HalfBaked\Distillery\Steps\ExtractCodeStep::class,       'status' => \HalfBaked\Distillery\ExpertStatus::Extracting],
+        ['name' => 'generate-dataset',   'class' => \HalfBaked\Distillery\Steps\GenerateDatasetStep::class,   'status' => \HalfBaked\Distillery\ExpertStatus::Distilling],
+        ['name' => 'train-model',        'class' => \HalfBaked\Distillery\Steps\TrainModelStep::class,        'status' => \HalfBaked\Distillery\ExpertStatus::Training],
+        ['name' => 'export-gguf',        'class' => \HalfBaked\Distillery\Steps\ExportGgufStep::class,        'status' => \HalfBaked\Distillery\ExpertStatus::Exporting],
+    ];
+
+    // Load distill provider settings
+    $distillProvider = $config['distill_provider'] ?? $registry->getSetting('distill_provider', 'anthropic');
+    $distillModel = $config['distill_model'] ?? $registry->getSetting('distill_model', '');
+    $apiBase = $registry->getSetting('api_base', '');
+    $openaiApiKey = $registry->getSetting('openai_api_key', '');
+
+    // Multi-source support: sources array from config, fallback to single source
+    $sources = $config['sources'] ?? [$source];
+
+    $data = [
+        'source' => $source,
+        'sources' => $sources,
+        'source_type' => $sourceType,
+        'work_dir' => $workDir,
+        'language' => $language,
+        'target_examples' => $targetExamples,
+        'model_name' => $expert['name'],
+        'base_model' => $baseModel,
+        'distill_provider' => $distillProvider,
+        'distill_model' => $distillModel,
+        'api_base' => $apiBase,
+        'openai_api_key' => $openaiApiKey,
+    ];
+
+    // Snapshot the full distillation config for reproducibility
+    $runConfig = array_merge($config, [
+        'model_size' => $modelSize,
+        'base_model' => $baseModel,
+        'target_examples' => $targetExamples,
+        'distill_provider' => $distillProvider,
+        'distill_model' => $distillModel,
+        'api_base' => $apiBase,
+        'started_at' => date('Y-m-d H:i:s'),
+        'python_bin' => \HalfBaked\Distillery\LanguageProfile::pythonBin(),
+    ]);
+    // Don't store actual API keys in the snapshot
+    unset($runConfig['api_key'], $runConfig['openai_api_key']);
+    $registry->update($id, ['config' => $runConfig]);
+
+    echo "Starting distillation pipeline for: {$expert['name']}\n";
+
+    $logDir = "{$workDir}/logs";
+    if (!is_dir($logDir)) {
+        mkdir($logDir, 0755, true);
+    }
+
+    // If resuming from a step, skip earlier steps and rebuild $data from artifacts
+    if ($fromStep) {
+        $stepNames = array_column($steps, 'name');
+        $fromIndex = array_search($fromStep, $stepNames);
+        if ($fromIndex === false) {
+            fwrite(STDERR, "Unknown step: {$fromStep}\nAvailable steps: " . implode(', ', $stepNames) . "\n");
+            exit(1);
+        }
+
+        echo "Resuming from step: {$fromStep} (skipping " . implode(', ', array_slice($stepNames, 0, $fromIndex)) . ")\n";
+
+        // Rebuild $data from existing artifacts
+        // Repo paths
+        $repoDir = "{$workDir}/repo";
+        $reposDir = "{$workDir}/repos";
+        if (is_dir($reposDir)) {
+            $data['repo_paths'] = array_filter(glob("{$reposDir}/*"), 'is_dir');
+            $data['repo_path'] = $data['repo_paths'][0] ?? $repoDir;
+        } elseif (is_dir($repoDir)) {
+            $data['repo_path'] = $repoDir;
+            $data['repo_paths'] = [$repoDir];
+        }
+
+        // Code samples + dataset
+        $samplesFile = "{$workDir}/data/code_samples.jsonl";
+        if (file_exists($samplesFile)) {
+            $data['samples_file'] = $samplesFile;
+            $data['samples_count'] = count(file($samplesFile, FILE_SKIP_EMPTY_LINES));
+        }
+        $datasetFile = "{$workDir}/data/dataset.jsonl";
+        if (file_exists($datasetFile)) {
+            $data['dataset_file'] = $datasetFile;
+            $data['dataset_count'] = count(file($datasetFile, FILE_SKIP_EMPTY_LINES));
+        }
+
+        // Language + profile from stored config
+        $storedConfig = $registry->get($id)['config'] ?? [];
+        $refreshedExpert = $registry->get($id);
+        if (!empty($storedConfig['detected_language'])) {
+            $data['language'] = $storedConfig['detected_language'];
+        } elseif (!empty($storedConfig['language']) && $storedConfig['language'] !== 'auto') {
+            $data['language'] = $storedConfig['language'];
+        } elseif (!empty($refreshedExpert['language'])) {
+            $data['language'] = $refreshedExpert['language'];
+        }
+        if (!empty($storedConfig['profile_class'])) {
+            $data['profile_class'] = $storedConfig['profile_class'];
+        }
+        // Derive profile_class from language if not stored
+        if (empty($data['profile_class']) && !empty($data['language'])) {
+            try {
+                $profile = \HalfBaked\Distillery\LanguageProfile::forLanguage($data['language']);
+                $data['profile_class'] = get_class($profile);
+            } catch (\Throwable $e) {
+                // Will fail at step validation if needed
+            }
+        }
+
+        // Validate required artifacts exist for the target step
+        $requiredArtifacts = [
+            'detect-language' => ['repo_path'],
+            'extract-code' => ['repo_path'],
+            'generate-dataset' => ['samples_file'],
+            'train-model' => ['dataset_file'],
+            'export-gguf' => ['dataset_file'],
+        ];
+        foreach ($requiredArtifacts[$fromStep] ?? [] as $key) {
+            if (empty($data[$key]) || ($key !== 'language' && !file_exists($data[$key]) && !is_dir($data[$key]))) {
+                fwrite(STDERR, "Cannot resume from {$fromStep}: missing artifact '{$key}'\n");
+                exit(1);
+            }
+        }
+
+        $steps = array_slice($steps, $fromIndex);
+    }
+
+    foreach ($steps as $stepDef) {
+        $stepName = $stepDef['name'];
+        $stepClass = $stepDef['class'];
+        $stepStatus = $stepDef['status'];
+
+        echo "\n>>> Step: {$stepName}\n";
+        $registry->updateStatus($id, $stepStatus);
+
+        $logFile = "{$logDir}/{$stepName}.log";
+        $logFh = fopen($logFile, 'w');
+
+        try {
+            $stepInstance = new $stepClass();
+            $startTime = microtime(true);
+            $data = $stepInstance->execute($data);
+            $duration = round(microtime(true) - $startTime, 2);
+
+            fwrite($logFh, date('[Y-m-d H:i:s]') . " Step {$stepName} completed in {$duration}s\n");
+
+            // Update metrics after key steps
+            if (isset($data['samples_count'])) {
+                $registry->update($id, ['samples_count' => $data['samples_count']]);
+            }
+            if (isset($data['dataset_count'])) {
+                $registry->update($id, ['dataset_count' => $data['dataset_count']]);
+            }
+            if (isset($data['training_loss']) && $data['training_loss'] > 0) {
+                $registry->update($id, ['training_loss' => $data['training_loss']]);
+            }
+            if (isset($data['language'])) {
+                $registry->update($id, ['language' => $data['language']]);
+            }
+            if (isset($data['frameworks']) && !empty($data['frameworks'])) {
+                $registry->update($id, ['framework' => implode(', ', $data['frameworks'])]);
+            }
+
+            echo "    Completed in {$duration}s\n";
+        } catch (\Throwable $e) {
+            fwrite($logFh, date('[Y-m-d H:i:s]') . " FAILED: {$e->getMessage()}\n");
+            fclose($logFh);
+            $registry->updateStatus($id, \HalfBaked\Distillery\ExpertStatus::Failed, "Failed at {$stepName}: {$e->getMessage()}");
+            fwrite(STDERR, "\nDistillation failed at step: {$stepName}\n");
+            fwrite(STDERR, "Error: {$e->getMessage()}\n");
+            exit(1);
+        }
+
+        fclose($logFh);
+    }
+
+    // All steps completed — update config with final pipeline results
+    $finalConfig = $registry->get($id)['config'] ?? [];
+    $finalConfig['completed_at'] = date('Y-m-d H:i:s');
+    $finalConfig['detected_language'] = $data['language'] ?? $language;
+    $finalConfig['profile_class'] = $data['profile_class'] ?? '';
+    $finalConfig['samples_count'] = $data['samples_count'] ?? 0;
+    $finalConfig['dataset_count'] = $data['dataset_count'] ?? 0;
+    $finalConfig['training_loss'] = $data['training_loss'] ?? 0;
+    $finalConfig['gguf_path'] = $data['gguf_path'] ?? '';
+    $finalConfig['gguf_size'] = $data['gguf_size'] ?? 0;
+    $registry->update($id, ['config' => $finalConfig]);
+
+    $registry->updateStatus($id, \HalfBaked\Distillery\ExpertStatus::Ready);
+    $registry->update($id, [
+        'gguf_path' => $data['gguf_path'] ?? '',
+        'gguf_size' => $data['gguf_size'] ?? 0,
+    ]);
+    echo "\nDistillation complete!\n";
+    echo "GGUF: " . ($data['gguf_path'] ?? 'unknown') . "\n";
+    echo "Model: " . ($data['model_name'] ?? $expert['name']) . "\n";
+}
+
+function distillList(\HalfBaked\Distillery\ExpertRegistry $registry): void
+{
+    $experts = $registry->list();
+
+    if (empty($experts)) {
+        echo "No experts found. Create one with: halfbaked distill create <source>\n";
+        return;
+    }
+
+    printf("%-36s %-20s %-10s %-10s %-8s %-8s %-10s\n",
+        'ID', 'Name', 'Language', 'Status', 'Samples', 'Dataset', 'GGUF');
+    echo str_repeat('-', 110) . "\n";
+
+    foreach ($experts as $e) {
+        $ggufSize = $e['gguf_size'] ? round($e['gguf_size'] / 1073741824, 1) . 'GB' : '-';
+        printf("%-36s %-20s %-10s %-10s %-8s %-8s %-10s\n",
+            $e['id'],
+            substr($e['name'], 0, 20),
+            $e['language'] ?: '-',
+            $e['status'],
+            $e['samples_count'] ?: '-',
+            $e['dataset_count'] ?: '-',
+            $ggufSize
+        );
+    }
+}
+
+function distillStatus(\HalfBaked\Distillery\ExpertRegistry $registry, array $positional): void
+{
+    $id = $positional[1] ?? '';
+    if (empty($id)) {
+        fwrite(STDERR, "Usage: halfbaked distill status <id>\n");
+        exit(1);
+    }
+
+    $expert = $registry->get($id);
+    if (!$expert) {
+        fwrite(STDERR, "Expert not found: {$id}\n");
+        exit(1);
+    }
+
+    echo "Expert: {$expert['name']}\n";
+    echo "ID:     {$expert['id']}\n";
+    echo "Status: {$expert['status']}\n";
+    echo "Source: {$expert['source_url']} ({$expert['source_type']})\n";
+    echo "Language:    {$expert['language']}\n";
+    echo "Framework:   {$expert['framework']}\n";
+    echo "Samples:     {$expert['samples_count']}\n";
+    echo "Dataset:     {$expert['dataset_count']}\n";
+    echo "Loss:        " . ($expert['training_loss'] ? number_format($expert['training_loss'], 4) : '-') . "\n";
+    echo "GGUF Path:   {$expert['gguf_path']}\n";
+    echo "GGUF Size:   " . ($expert['gguf_size'] ? round($expert['gguf_size'] / 1073741824, 2) . ' GB' : '-') . "\n";
+    echo "Model Size:  {$expert['model_size']}\n";
+    if ($expert['error']) {
+        echo "Error:       {$expert['error']}\n";
+    }
+    echo "Created:     {$expert['created_at']}\n";
+    echo "Updated:     {$expert['updated_at']}\n";
+}
+
+function distillLogs(\HalfBaked\Distillery\ExpertRegistry $registry, array $positional, array $flags, string $dataDir): void
+{
+    $id = $positional[1] ?? '';
+    if (empty($id)) {
+        fwrite(STDERR, "Usage: halfbaked distill logs <id> [--step=train]\n");
+        exit(1);
+    }
+
+    $expert = $registry->get($id);
+    if (!$expert) {
+        fwrite(STDERR, "Expert not found: {$id}\n");
+        exit(1);
+    }
+
+    $step = $flags['step'] ?? null;
+    $workDir = "{$dataDir}/experts/{$id}";
+
+    if ($step) {
+        $logFile = "{$workDir}/{$step}.log";
+        if (!file_exists($logFile)) {
+            $logFile = "{$workDir}/logs/{$step}.log";
+        }
+    } else {
+        // Find most recent log
+        $logFile = null;
+        foreach (['export', 'train', 'distill', 'extract', 'launch'] as $s) {
+            foreach (["{$workDir}/{$s}.log", "{$workDir}/logs/{$s}.log"] as $path) {
+                if (file_exists($path)) {
+                    $logFile = $path;
+                    break 2;
+                }
+            }
+        }
+    }
+
+    if (!$logFile || !file_exists($logFile)) {
+        echo "No logs found for expert {$id}\n";
+        return;
+    }
+
+    echo "=== {$logFile} ===\n";
+    $lines = file($logFile);
+    echo implode('', array_slice($lines, -100));
+}
+
+function distillRemove(\HalfBaked\Distillery\ExpertRegistry $registry, array $positional, string $dataDir): void
+{
+    $id = $positional[1] ?? '';
+    if (empty($id)) {
+        fwrite(STDERR, "Usage: halfbaked distill remove <id>\n");
+        exit(1);
+    }
+
+    $expert = $registry->get($id);
+    if (!$expert) {
+        fwrite(STDERR, "Expert not found: {$id}\n");
+        exit(1);
+    }
+
+    // Remove GGUF
+    if (!empty($expert['gguf_path']) && file_exists($expert['gguf_path'])) {
+        unlink($expert['gguf_path']);
+        echo "Removed GGUF: {$expert['gguf_path']}\n";
+    }
+
+    // Remove work directory
+    $workDir = "{$dataDir}/experts/{$id}";
+    if (is_dir($workDir)) {
+        exec('rm -rf ' . escapeshellarg($workDir));
+        echo "Removed work directory: {$workDir}\n";
+    }
+
+    $registry->delete($id);
+    echo "Removed expert: {$expert['name']} ({$id})\n";
+}
+
+function distillHelp(): void
+{
+    echo <<<'HELP'
+HalfBaked Distillery — train specialist GGUF models from any codebase
+
+Commands:
+  halfbaked distill serve [--port=8585]          Start unified web server
+  halfbaked distill create <source> [--name=X]   Start distillation from CLI
+  halfbaked distill import <name> [--ollama=X]   Import existing GGUF as expert
+  halfbaked distill list                         Show all experts + status
+  halfbaked distill status <id>                  Show expert detail
+  halfbaked distill logs <id> [--step=train]     Tail training logs
+  halfbaked distill remove <id>                  Remove expert + GGUF
+
+Create flags:
+  --name=<name>         Expert model name (default: repo name)
+  --language=<lang>     Language override (php, python, javascript, css)
+  --model-size=<size>   Base model size: 0.5b, 1.5b, 3b, 7b (default: 7b)
+  --target=<N>          Target training examples (default: 1000)
+
+Serve flags:
+  --host=<host>         Bind address (default: 127.0.0.1)
+  --port=<port>         Port number (default: 8585)
+
+Examples:
+  halfbaked distill create https://github.com/user/project --name=my-expert
+  halfbaked distill create /path/to/project --language=php --target=500
+  halfbaked distill serve --port=9000
+  halfbaked distill list
+
+HELP;
+}
+
+function cmdHelp(): void
+{
+    echo <<<'HELP'
+HalfBaked CLI — codebase-aware code generation + model distillery + feature builder
+
+Commands:
+  generate <task>    Generate PHP code using voidlux-coder with codebase context
+  build <sub>        Multi-expert feature builder (decompose + generate + assemble)
+  distill <sub>      Train specialist GGUF models (serve, create, list, status, logs, remove)
+  models             List available Ollama models
+  check              Verify voidlux-coder is available
+  scan               Show PHP files in project
+
+Generate flags:
+  --path=<dir>       Project directory to scan (default: cwd)
+  --context=<files>  Comma-separated files to include as context
+  --files=<dirs>     Comma-separated directories to scan for context
+  --model=<name>     Override model (default: voidlux-coder / $HALFBAKED_MODEL)
+  --max-tokens=N     Max generation tokens (default: 2048)
+  --max-context=N    Max context chars (default: 16000)
+  --num-ctx=N        Context window size (default: 8192)
+
+Build (run `halfbaked build` for full help):
+  halfbaked build "Add product CRUD" --path=/my/project
+  halfbaked build serve --port=8585
+  halfbaked build list
+  halfbaked build status <id>
+
+Backend flags:
+  --backend=gguf     Use llama-cli directly instead of Ollama
+  --gguf=<path>      Path to GGUF model file (auto-detected if omitted)
+  --llama-cli=<path> Path to llama-cli binary (auto-detected if omitted)
+  --gpu-layers=N     GPU layers to offload (default: 99 = all)
+  --threads=N        CPU threads (default: 4)
+
+Distillery (run `halfbaked distill` for full help):
+  halfbaked distill serve              Start the wizard web UI
+  halfbaked distill create <source>    Train a new expert from a repo
+  halfbaked distill list               Show all experts
+
+Examples:
+  halfbaked generate "Add a product search endpoint with filtering"
+  halfbaked build "Add user authentication" --path=./my-app
+  halfbaked distill create ../my-project --name=my-expert
+  halfbaked distill serve --port=8484
+
+Environment:
+  HALFBAKED_MODEL    Default model (default: voidlux-coder)
+  HALFBAKED_HOST     Ollama host (default: 127.0.0.1)
+  HALFBAKED_PORT     Ollama port (default: 11434)
+
+HELP;
+}
+
+// =====================================================================
+// File Discovery
+// =====================================================================
+
+/**
+ * Auto-discover relevant files based on task keywords.
+ */
+function autoDiscover(string $projectPath, string $task): array
+{
+    $files = [];
+
+    // Extract keywords from task
+    $keywords = extractKeywords($task);
+
+    // Scan for PHP files matching keywords
+    $allFiles = scanPhpFiles($projectPath, 200);
+
+    // Score each file by keyword relevance
+    $scored = [];
+    foreach ($allFiles as $file) {
+        $rel = strtolower(str_replace($projectPath . '/', '', $file));
+        $score = 0;
+
+        foreach ($keywords as $kw) {
+            $kw = strtolower($kw);
+            // Filename match
+            if (str_contains($rel, $kw)) {
+                $score += 10;
+            }
+            // Content match (first 50 lines only for speed)
+            $head = implode("\n", array_slice(file($file) ?: [], 0, 50));
+            if (stripos($head, $kw) !== false) {
+                $score += 3;
+            }
+        }
+
+        // Boost common patterns
+        if (str_contains($rel, 'service')) $score += 2;
+        if (str_contains($rel, 'controller') || str_contains($rel, 'control')) $score += 2;
+        if (str_contains($rel, 'model')) $score += 1;
+
+        // De-prioritize tests and vendor
+        if (str_contains($rel, 'test')) $score -= 5;
+        if (str_contains($rel, 'vendor')) $score -= 100;
+
+        if ($score > 0) {
+            $scored[$file] = $score;
+        }
+    }
+
+    arsort($scored);
+
+    // Return top 8 most relevant
+    return array_slice(array_keys($scored), 0, 8);
+}
+
+/**
+ * Extract meaningful keywords from a task description.
+ */
+function extractKeywords(string $task): array
+{
+    // Remove stopwords
+    $stop = ['a','an','the','and','or','to','for','of','in','on','with','that','this','is','are',
+             'was','were','be','been','being','have','has','had','do','does','did','will','would',
+             'could','should','can','may','might','must','shall','add','create','write','build',
+             'make','implement','generate','update','fix','refactor','new'];
+
+    $words = preg_split('/[\s,.:;!?]+/', strtolower($task));
+    $keywords = [];
+    foreach ($words as $word) {
+        $word = trim($word, '"\'()[]{}');
+        if (strlen($word) >= 3 && !in_array($word, $stop)) {
+            $keywords[] = $word;
+        }
+    }
+
+    return array_unique($keywords);
+}
+
+/**
+ * Scan directory for PHP files (excluding vendor, node_modules, .git).
+ */
+function scanPhpFiles(string $dir, int $limit = 50): array
+{
+    $files = [];
+    $skip = ['vendor', 'node_modules', '.git', '.svn', 'cache', 'storage', 'logs'];
+
+    $iter = new \RecursiveIteratorIterator(
+        new \RecursiveCallbackFilterIterator(
+            new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS),
+            function ($current, $key, $iterator) use ($skip) {
+                if ($current->isDir()) {
+                    return !in_array($current->getFilename(), $skip);
+                }
+                return $current->getExtension() === 'php';
+            }
+        )
+    );
+
+    foreach ($iter as $file) {
+        if ($file->isFile() && $file->getExtension() === 'php') {
+            $files[] = $file->getPathname();
+            if (count($files) >= $limit) break;
+        }
+    }
+
+    return $files;
+}
+
+/**
+ * Build a context block from file contents, respecting max size.
+ */
+function buildContext(array $files, string $basePath, int $maxChars): string
+{
+    $context = '';
+    $remaining = $maxChars;
+
+    foreach ($files as $file) {
+        if ($remaining <= 0) break;
+
+        $rel = str_replace($basePath . '/', '', $file);
+        $content = file_get_contents($file);
+        if ($content === false) continue;
+
+        // Truncate large files
+        if (strlen($content) > 3000) {
+            $content = substr($content, 0, 3000) . "\n// ... truncated ...";
+        }
+
+        $block = "### {$rel}\n```php\n{$content}\n```\n\n";
+
+        if (strlen($block) > $remaining) {
+            break;
+        }
+
+        $context .= $block;
+        $remaining -= strlen($block);
+    }
+
+    return $context;
+}
