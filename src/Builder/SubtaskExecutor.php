@@ -105,12 +105,16 @@ class SubtaskExecutor
             // Build prompt with prerequisite results
             $prompt = $this->buildPrompt($subtask, $subtasks, $idMap, $projectContext);
 
+            // Persist the prompt for preference-pair harvesting
+            $this->registry->updateSubtask($subtask['id'], ['prompt' => $prompt]);
+
             // Execute via Ollama with validate-retry loop
             $domain = $subtask['domain'] ?? 'backend';
             $attempt = 0;
             $lastResult = '';
             $lastFiles = [];
             $lastErrors = [];
+            $attemptsLog = [];
             $success = false;
 
             while ($attempt < self::MAX_RETRIES) {
@@ -130,6 +134,14 @@ class SubtaskExecutor
                     // Validate the generated output
                     $lastErrors = $this->validateGenerated($lastFiles, $subtask);
 
+                    // Log this attempt for DPO preference-pair harvesting
+                    $attemptsLog[] = [
+                        'attempt' => $attempt,
+                        'output' => $lastResult,
+                        'errors' => $lastErrors,
+                        'accepted' => empty($lastErrors),
+                    ];
+
                     if (empty($lastErrors)) {
                         $success = true;
                         break;
@@ -141,6 +153,12 @@ class SubtaskExecutor
                     }
                 } catch (\Throwable $e) {
                     $lastErrors = ["Generation error: {$e->getMessage()}"];
+                    $attemptsLog[] = [
+                        'attempt' => $attempt,
+                        'output' => $lastResult,
+                        'errors' => $lastErrors,
+                        'accepted' => false,
+                    ];
                     $this->log("  Attempt {$attempt} threw: {$e->getMessage()}");
                 }
             }
@@ -151,6 +169,7 @@ class SubtaskExecutor
                     'generated_code' => $lastResult,
                     'files' => $lastFiles,
                     'attempts' => $attempt,
+                    'attempts_log' => $attemptsLog,
                 ]);
                 $subtask['status'] = 'completed';
                 $subtask['generated_code'] = $lastResult;
@@ -170,6 +189,7 @@ class SubtaskExecutor
                     'generated_code' => $lastResult, // Store last attempt for inspection
                     'files' => $lastFiles,
                     'attempts' => $attempt,
+                    'attempts_log' => $attemptsLog,
                 ]);
                 $subtask['status'] = 'failed';
                 $failed++;

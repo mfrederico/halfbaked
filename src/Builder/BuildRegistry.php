@@ -71,11 +71,18 @@ class BuildRegistry
             )
         SQL);
 
-        // Migration: add attempts column to existing databases
-        try {
-            $this->db->exec('ALTER TABLE build_subtasks ADD COLUMN attempts INTEGER DEFAULT 0');
-        } catch (\PDOException) {
-            // Column already exists
+        // Migrations: add columns to existing databases
+        $migrations = [
+            'ALTER TABLE build_subtasks ADD COLUMN attempts INTEGER DEFAULT 0',
+            'ALTER TABLE build_subtasks ADD COLUMN prompt TEXT',
+            'ALTER TABLE build_subtasks ADD COLUMN attempts_log TEXT',
+        ];
+        foreach ($migrations as $sql) {
+            try {
+                $this->db->exec($sql);
+            } catch (\PDOException) {
+                // Column already exists
+            }
         }
     }
 
@@ -242,6 +249,7 @@ class BuildRegistry
             'local_id', 'title', 'description', 'domain', 'expert_model',
             'complexity', 'status', 'depends_on', 'work_instructions',
             'acceptance_criteria', 'generated_code', 'files', 'error', 'sort_order', 'attempts',
+            'prompt', 'attempts_log',
         ];
 
         $sets = [];
