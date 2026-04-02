@@ -2,8 +2,9 @@
 vendor/
 composer.lock
 
-# Training & data
-training/
+# Training & data (track Python scripts only)
+training/*
+!training/*.py
 data/
 unsloth_compiled_cache/
 

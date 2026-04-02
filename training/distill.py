@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""
+Multi-language dataset generator via Claude distillation.
+Reads code_samples.jsonl, generates instruction-response pairs.
+
+Usage:
+  python3 distill.py --config config.json
+  python3 distill.py --config config.json --resume
+  python3 distill.py --config config.json --dry-run
+"""
+
+import argparse
+import json
+import os
+import random
+import re
+import sys
+import time
+from pathlib import Path
+
+try:
+    import anthropic
+except ImportError:
+    print("Installing anthropic SDK...")
+    os.system(f"{sys.executable} -m pip install anthropic")
+    import anthropic
+
+
+def load_config(config_path: str) -> dict:
+    with open(config_path) as f:
+        return json.loads(f.read())
+
+
+def load_samples(samples_file: str) -> list[dict]:
+    samples = []
+    with open(samples_file) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                samples.append(json.loads(line))
+    return samples
+
+
+def load_progress(progress_file: str) -> dict:
+    if os.path.exists(progress_file):
+        return json.loads(Path(progress_file).read_text())
+    return {"completed": 0, "pairs_generated": 0, "batch_index": 0}
+
+
+def save_progress(progress_file: str, progress: dict):
+    Path(progress_file).write_text(json.dumps(progress))
+
+
+def get_code_for_sample(sample: dict) -> tuple[str, str]:
+    if sample["type"] == "method":
+        code = sample["method"]["code"]
+        if sample["method"].get("docblock"):
+            code = sample["method"]["docblock"] + "\n" + code
+        return code, sample["metadata"]["file"]
+    elif sample["type"] == "component":
+        code = sample["component"]["code"]
+        return code, sample["metadata"]["file"]
+    else:
+        content = sample["content"]
+        lines = content.split("\n")
+        if len(lines) > 150:
+            content = "\n".join(lines[:150]) + "\n// ... (truncated)"
+        return content, sample["metadata"]["file"]
+
+
+# --- JSON Parsing (4-strategy, handles code in JSON strings) ---
+
+def parse_response(text: str) -> list[dict]:
+    text = text.strip()
+
+    # Strategy 1: Direct JSON parse
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            return _filter_pairs(data)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: Strip markdown code fences
+    cleaned = text
+    if cleaned.startswith("```"):
+        first_nl = cleaned.find("\n")
+        if first_nl > 0:
+            cleaned = cleaned[first_nl + 1:]
+        if cleaned.rstrip().endswith("```"):
+            cleaned = cleaned.rstrip()[:-3].rstrip()
+        try:
+            data = json.loads(cleaned)
+            if isinstance(data, list):
+                return _filter_pairs(data)
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 3: Bracket-depth scanner respecting JSON strings
+    pairs = _extract_json_array(text)
+    if pairs is not None:
+        return _filter_pairs(pairs)
+
+    # Strategy 4: Regex extraction of individual objects
+    results = []
+    for m in re.finditer(r'\{\s*"instruction"\s*:', text):
+        start = m.start()
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            c = text[i]
+            if escape:
+                escape = False
+                continue
+            if c == '\\':
+                escape = True
+                continue
+            if c == '"' and not escape:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(text[start:i + 1])
+                        if "instruction" in obj and "response" in obj:
+                            results.append(obj)
+                    except json.JSONDecodeError:
+                        pass
+                    break
+    return results
+
+
+def _extract_json_array(text: str) -> list | None:
+    start = -1
+    for i, c in enumerate(text):
+        if c == '[':
+            start = i
+            break
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if escape:
+            escape = False
+            continue
+        if c == '\\':
+            escape = True
+            continue
+        if c == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == '[':
+            depth += 1
+        elif c == ']':
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+def _filter_pairs(data: list) -> list[dict]:
+    return [
+        p for p in data
+        if isinstance(p, dict) and "instruction" in p and "response" in p
+    ]
+
+
+def format_for_training(instruction: str, response: str, system_prompt: str) -> dict:
+    return {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": instruction},
+            {"role": "assistant", "content": response},
+        ]
+    }
+
+
+def build_generation_plan(
+    samples: list[dict],
+    target: int,
+    batch_size: int,
+    prompt_templates: list[dict],
+    standalone_prompts: list[dict],
+) -> list[dict]:
+    plan = []
+
+    code_budget = int(target * 0.4)
+    standalone_budget = target - code_budget
+
+    method_samples = [s for s in samples if s["type"] in ("method", "component")]
+    file_samples = [s for s in samples if s["type"] == "full_file"]
+
+    # Score methods by relevance
+    scored_methods = []
+    for s in method_samples:
+        code = s.get("method", s.get("component", {})).get("code", "")
+        score = len(code.split("\n"))
+        if s.get("method", {}).get("docblock"):
+            score += 10
+        scored_methods.append((score, s))
+    scored_methods.sort(key=lambda x: -x[0])
+
+    # Code-context batches
+    selected = [s for _, s in scored_methods[:code_budget // batch_size + 5]]
+    random.shuffle(selected)
+
+    templates = prompt_templates.copy()
+    for i in range(0, min(len(selected), code_budget // batch_size)):
+        sample = selected[i % len(selected)]
+        template = templates[i % len(templates)]
+        code, filepath = get_code_for_sample(sample)
+        plan.append({
+            "type": "code_context",
+            "category": template["category"],
+            "prompt": template["prompt"].replace("{n}", str(batch_size)).replace("{file}", filepath).replace("{code}", code),
+            "expected_pairs": batch_size,
+        })
+
+    # Standalone batches
+    standalone_batch = 8
+    for template in standalone_prompts:
+        repeats = max(1, standalone_budget // (len(standalone_prompts) * standalone_batch))
+        for _ in range(repeats):
+            plan.append({
+                "type": "standalone",
+                "category": template["category"],
+                "prompt": template["prompt"].replace("{n}", str(standalone_batch)),
+                "expected_pairs": standalone_batch,
+            })
+
+    random.shuffle(plan)
+    return plan
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Multi-language dataset generator")
+    parser.add_argument("--config", help="Config JSON file path")
+    parser.add_argument("--samples", help="Code samples JSONL file")
+    parser.add_argument("--output", help="Output dataset JSONL file")
+    parser.add_argument("--api-key", help="API key (Anthropic or OpenAI-compatible)")
+    parser.add_argument("--provider", choices=["anthropic", "openai"], default="anthropic",
+                        help="LLM provider: 'anthropic' (Claude SDK) or 'openai' (OpenAI-compatible: Ollama, OpenRouter, Together, Groq, etc.)")
+    parser.add_argument("--model", help="Model name (e.g. claude-sonnet-4-20250514, kimi2.5:cloud, gpt-4o)")
+    parser.add_argument("--api-base", default="http://127.0.0.1:11434/v1", help="OpenAI-compatible API base URL (default: Ollama)")
+    parser.add_argument("--target", type=int, default=1000, help="Target number of examples")
+    parser.add_argument("--batch-size", type=int, default=5, help="Pairs per API call")
+    parser.add_argument("--system-prompt", help="System prompt for generation")
+    parser.add_argument("--resume", action="store_true", help="Resume from last run")
+    parser.add_argument("--dry-run", action="store_true", help="Preview prompts only")
+    args = parser.parse_args()
+
+    if args.config:
+        config = load_config(args.config)
+    else:
+        config = {}
+
+    samples_file = config.get("samples_file", args.samples or "code_samples.jsonl")
+    output_file = config.get("output_file", args.output or "dataset.jsonl")
+    api_key = config.get("api_key", args.api_key or os.environ.get("ANTHROPIC_API_KEY"))
+    provider = config.get("provider", args.provider)
+    model_name = config.get("model", args.model)
+    api_base = config.get("api_base", config.get("ollama_host", args.api_base))
+    # Normalize: if api_base doesn't end with /v1, append it (e.g. http://localhost:11434 → http://localhost:11434/v1)
+    if api_base and not api_base.rstrip("/").endswith("/v1"):
+        api_base = api_base.rstrip("/") + "/v1"
+    system_prompt = config.get("system_prompt", args.system_prompt or "You are generating training data for a coding assistant.")
+    prompt_templates = config.get("prompt_templates", [])
+    standalone_prompts = config.get("standalone_prompts", [])
+    target_examples = config.get("target_examples", args.target)
+    batch_size = config.get("batch_size", args.batch_size)
+    training_system_prompt = config.get("training_system_prompt", "You are a helpful coding assistant.")
+
+    # Default model per provider
+    if not model_name:
+        model_name = "claude-sonnet-4-20250514" if provider == "anthropic" else "kimi2.5:cloud"
+
+    # Map legacy "ollama" provider to "openai"
+    if provider == "ollama":
+        provider = "openai"
+
+    if not os.path.exists(samples_file):
+        print(f"Samples file not found: {samples_file}")
+        print("Run extract.py first!")
+        sys.exit(1)
+
+    if not api_key and not args.dry_run:
+        if provider == "anthropic":
+            print("Set ANTHROPIC_API_KEY or pass --api-key")
+            sys.exit(1)
+        else:
+            api_key = os.environ.get("OPENAI_API_KEY", "ollama")  # Ollama doesn't need a real key
+
+    # Default templates if none provided
+    if not prompt_templates:
+        prompt_templates = [
+            {"category": "explain", "prompt": "Given this code, generate {n} instruction-response pairs explaining it.\n\nCode from `{file}`:\n```\n{code}\n```\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
+            {"category": "generate", "prompt": "Based on this code pattern, generate {n} instruction-response pairs asking to write similar code.\n\nCode from `{file}`:\n```\n{code}\n```\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
+        ]
+    if not standalone_prompts:
+        standalone_prompts = [
+            {"category": "knowledge", "prompt": "Generate {n} instruction-response pairs about coding best practices.\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
+        ]
+
+    samples = load_samples(samples_file)
+    print(f"Loaded {len(samples)} code samples")
+
+    plan = build_generation_plan(samples, target_examples, batch_size, prompt_templates, standalone_prompts)
+    total_expected = sum(p["expected_pairs"] for p in plan)
+    print(f"Generation plan: {len(plan)} API calls, ~{total_expected} expected pairs")
+
+    if args.dry_run:
+        for i, step in enumerate(plan[:5]):
+            print(f"\n--- Batch {i + 1} ({step['category']}) ---")
+            print(step["prompt"][:500] + "...")
+        print(f"\n... and {len(plan) - 5} more batches")
+        return
+
+    # Progress tracking
+    output_dir = str(Path(output_file).parent)
+    progress_file = os.path.join(output_dir, ".generate_progress.json")
+    progress = load_progress(progress_file) if args.resume else {"completed": 0, "pairs_generated": 0, "batch_index": 0}
+    start_batch = progress["batch_index"]
+
+    # Initialize LLM client based on provider
+    if provider == "anthropic":
+        client = anthropic.Anthropic(api_key=api_key)
+    else:
+        client = None
+
+    def call_llm(sys_prompt: str, user_prompt: str) -> str:
+        """Call the LLM provider and return response text."""
+        if provider == "anthropic":
+            response = client.messages.create(
+                model=model_name,
+                max_tokens=4096,
+                system=sys_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            return response.content[0].text
+        else:
+            # OpenAI-compatible API (works with Ollama, OpenRouter, Together, Groq, OpenAI, etc.)
+            import urllib.request
+            url = f"{api_base}/chat/completions"
+            headers = {"Content-Type": "application/json"}
+            if api_key and api_key != "ollama":
+                headers["Authorization"] = f"Bearer {api_key}"
+            payload = json.dumps({
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "max_tokens": 4096,
+                "temperature": 0.7,
+            }).encode()
+            req = urllib.request.Request(url, data=payload, headers=headers)
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                data = json.loads(resp.read())
+            return data["choices"][0]["message"]["content"]
+
+    print(f"Provider: {provider} | Model: {model_name}" + (f" | Base: {api_base}" if provider == "openai" else ""))
+
+    mode = "a" if args.resume and os.path.exists(output_file) else "w"
+    total_pairs = progress["pairs_generated"]
+
+    with open(output_file, mode) as f:
+        for i, step in enumerate(plan[start_batch:], start=start_batch):
+            if total_pairs >= target_examples:
+                print(f"\nReached target of {target_examples} pairs!")
+                break
+
+            print(
+                f"\rBatch {i + 1}/{len(plan)} | {step['category']:20s} | {total_pairs} pairs",
+                end="", flush=True,
+            )
+
+            try:
+                text = call_llm(system_prompt, step["prompt"])
+
+                pairs = parse_response(text)
+
+                for pair in pairs:
+                    training_example = format_for_training(
+                        pair["instruction"], pair["response"], training_system_prompt
+                    )
+                    f.write(json.dumps(training_example) + "\n")
+                    total_pairs += 1
+
+                f.flush()
+
+                progress = {
+                    "completed": i + 1,
+                    "pairs_generated": total_pairs,
+                    "batch_index": i + 1,
+                }
+                save_progress(progress_file, progress)
+
+                time.sleep(0.5)
+
+            except Exception as e:
+                print(f"\nError on batch {i + 1}: {e}")
+                save_progress(progress_file, progress)
+                time.sleep(2)
+                continue
+
+    print(f"\n\nDone! Generated {total_pairs} training pairs")
+    print(f"Output: {output_file}")
+
+    if os.path.exists(output_file):
+        with open(output_file) as f:
+            count = sum(1 for _ in f)
+        print(f"Total examples in file: {count}")
+
+
+if __name__ == "__main__":
+    main()
