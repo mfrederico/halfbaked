@@ -26,6 +26,7 @@ MODELS = {
     "1.5b": "unsloth/Qwen2.5-Coder-1.5B-Instruct",
     "3b": "unsloth/Qwen2.5-Coder-3B-Instruct",
     "7b": "unsloth/Qwen2.5-Coder-7B-Instruct",
+    "7b-tools": "unsloth/Qwen2.5-7B-Instruct",
     "9b": "unsloth/Qwen3.5-9B",
     "14b": "unsloth/Qwen2.5-Coder-14B-Instruct",
 }
