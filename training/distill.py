@@ -190,17 +190,118 @@ def format_for_training(instruction: str, response: str, system_prompt: str) -> 
     }
 
 
+def format_tool_conversation(conversation: dict, system_prompt: str) -> dict | None:
+    """Format a tool-calling conversation for training.
+
+    Expected input from Claude:
+    {
+        "tools": [{"name": "...", "description": "...", "parameters": {...}}],
+        "user_request": "...",
+        "tool_call": {"name": "...", "arguments": {...}},
+        "tool_result": "...",
+        "final_response": "..."
+    }
+    """
+    try:
+        tools = conversation.get("tools", [])
+        user_req = conversation.get("user_request", "")
+        tool_call = conversation.get("tool_call", {})
+        tool_result = conversation.get("tool_result", "")
+        final_response = conversation.get("final_response", "")
+
+        if not all([tools, user_req, tool_call, final_response]):
+            return None
+
+        # Build the system prompt with tool definitions (Qwen2.5 format)
+        tools_section = "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+        tools_section += "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n"
+        for tool in tools:
+            tools_section += json.dumps({"type": "function", "function": tool}) + "\n"
+        tools_section += "</tools>\n\n"
+        tools_section += "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
+        tools_section += '<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>'
+
+        full_system = system_prompt + tools_section
+
+        # Build the tool call response
+        tool_call_text = "<tool_call>\n" + json.dumps({
+            "name": tool_call.get("name", ""),
+            "arguments": tool_call.get("arguments", {})
+        }) + "\n</tool_call>"
+
+        # Build the tool response
+        tool_response_text = "<tool_response>\n" + (
+            json.dumps(tool_result) if isinstance(tool_result, (dict, list)) else str(tool_result)
+        ) + "\n</tool_response>"
+
+        return {
+            "messages": [
+                {"role": "system", "content": full_system},
+                {"role": "user", "content": user_req},
+                {"role": "assistant", "content": tool_call_text},
+                {"role": "user", "content": tool_response_text},
+                {"role": "assistant", "content": final_response},
+            ]
+        }
+    except Exception:
+        return None
+
+
+TOOL_CALL_PROMPT = """Given this PHP code from a real project, generate {n} realistic tool-calling conversation examples.
+
+Each example should show a user asking for something that requires calling a tool/function, the model deciding which tool to call, receiving the result, and giving a final answer.
+
+Create realistic tools that a PHP developer would use: database queries, file operations, API calls, code analysis, running tests, etc.
+
+Code context from `{file}`:
+```php
+{code}
+```
+
+Return a JSON array where each element has:
+- "tools": array of tool definitions with "name", "description", "parameters" (JSON Schema)
+- "user_request": what the user asks
+- "tool_call": {{"name": "tool_name", "arguments": {{...}}}}
+- "tool_result": realistic result data
+- "final_response": assistant's answer incorporating the tool result
+
+Make the tools and requests relevant to this codebase. Include tools like:
+- query_database: run SQL/RedBean queries
+- read_file: read project files
+- run_php: execute PHP code
+- list_routes: list FlightPHP routes
+- check_syntax: validate PHP syntax
+- search_code: grep through codebase"""
+
+
+TOOL_CALL_STANDALONE_PROMPT = """Generate {n} realistic tool-calling conversation examples for a PHP coding assistant.
+
+The assistant has access to tools for: database queries (RedBeanPHP), file operations, running PHP code, listing FlightPHP routes, checking syntax, searching codebases, managing Ollama models, and calling APIs.
+
+Return a JSON array where each element has:
+- "tools": array of tool definitions with "name", "description", "parameters" (JSON Schema)
+- "user_request": what the user asks
+- "tool_call": {{"name": "tool_name", "arguments": {{...}}}}
+- "tool_result": realistic result data
+- "final_response": assistant's answer incorporating the tool result
+
+Vary the complexity: some simple single-tool calls, some that require interpreting results.
+Make requests realistic: checking logs, querying data, finding code patterns, running tests."""
+
+
 def build_generation_plan(
     samples: list[dict],
     target: int,
     batch_size: int,
     prompt_templates: list[dict],
     standalone_prompts: list[dict],
+    tool_call_ratio: float = 0.2,
 ) -> list[dict]:
     plan = []
 
-    code_budget = int(target * 0.4)
-    standalone_budget = target - code_budget
+    tool_budget = int(target * tool_call_ratio)
+    code_budget = int((target - tool_budget) * 0.45)
+    standalone_budget = target - code_budget - tool_budget
 
     method_samples = [s for s in samples if s["type"] in ("method", "component")]
     file_samples = [s for s in samples if s["type"] == "full_file"]
@@ -241,6 +342,34 @@ def build_generation_plan(
                 "category": template["category"],
                 "prompt": template["prompt"].replace("{n}", str(standalone_batch)),
                 "expected_pairs": standalone_batch,
+            })
+
+    # Tool-calling batches (code-context + standalone)
+    tool_batch = 3  # Fewer per batch — tool conversations are complex
+    if tool_budget > 0:
+        # Code-context tool calls
+        all_samples = selected or method_samples or file_samples or samples
+        tool_code_count = tool_budget // 2
+        for i in range(tool_code_count // tool_batch):
+            if not all_samples:
+                break
+            sample = all_samples[i % len(all_samples)]
+            code, filepath = get_code_for_sample(sample)
+            plan.append({
+                "type": "tool_call",
+                "category": "tool_call",
+                "prompt": TOOL_CALL_PROMPT.replace("{n}", str(tool_batch)).replace("{file}", filepath).replace("{code}", code),
+                "expected_pairs": tool_batch,
+            })
+
+        # Standalone tool calls
+        tool_standalone_count = tool_budget - tool_code_count
+        for _ in range(tool_standalone_count // tool_batch):
+            plan.append({
+                "type": "tool_call",
+                "category": "tool_call_standalone",
+                "prompt": TOOL_CALL_STANDALONE_PROMPT.replace("{n}", str(tool_batch)),
+                "expected_pairs": tool_batch,
             })
 
     random.shuffle(plan)
@@ -395,9 +524,17 @@ def main():
                 pairs = parse_response(text)
 
                 for pair in pairs:
-                    training_example = format_for_training(
-                        pair["instruction"], pair["response"], training_system_prompt
-                    )
+                    if step.get("type") == "tool_call":
+                        # Tool-calling format: multi-turn with tool_call/tool_response
+                        training_example = format_tool_conversation(
+                            pair, training_system_prompt
+                        )
+                        if training_example is None:
+                            continue
+                    else:
+                        training_example = format_for_training(
+                            pair["instruction"], pair["response"], training_system_prompt
+                        )
                     f.write(json.dumps(training_example) + "\n")
                     total_pairs += 1
 
