@@ -181,12 +181,24 @@ def generate_batch(client: anthropic.Anthropic, model: str, batch_size: int) -> 
 
     prompt = GENERATION_PROMPT.replace("{n}", str(batch_size)).replace("{context}", context)
 
-    response = client.messages.create(
-        model=model,
-        max_tokens=8192,
-        system="You are generating training data. Output ONLY valid JSON arrays. No markdown fences, no commentary.",
-        messages=[{"role": "user", "content": prompt}],
-    )
+    for attempt in range(5):
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=8192,
+                system="You are generating training data. Output ONLY valid JSON arrays. No markdown fences, no commentary.",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            break
+        except Exception as e:
+            if "429" in str(e) or "rate_limit" in str(e):
+                wait = 15 * (attempt + 1)
+                print(f"\n  Rate limited, waiting {wait}s...", end="", flush=True)
+                time.sleep(wait)
+                continue
+            raise
+    else:
+        return []
 
     text = response.content[0].text.strip()
 

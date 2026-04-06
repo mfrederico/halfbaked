@@ -475,15 +475,25 @@ def main():
         client = None
 
     def call_llm(sys_prompt: str, user_prompt: str) -> str:
-        """Call the LLM provider and return response text."""
+        """Call the LLM provider and return response text. Retries on rate limit."""
         if provider == "anthropic":
-            response = client.messages.create(
-                model=model_name,
-                max_tokens=4096,
-                system=sys_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-            return response.content[0].text
+            for attempt in range(5):
+                try:
+                    response = client.messages.create(
+                        model=model_name,
+                        max_tokens=4096,
+                        system=sys_prompt,
+                        messages=[{"role": "user", "content": user_prompt}],
+                    )
+                    return response.content[0].text
+                except Exception as e:
+                    if "429" in str(e) or "rate_limit" in str(e):
+                        wait = 15 * (attempt + 1)
+                        print(f"\n  Rate limited, waiting {wait}s...", end="", flush=True)
+                        time.sleep(wait)
+                        continue
+                    raise
+            raise RuntimeError("Rate limited after 5 retries")
         else:
             # OpenAI-compatible API (works with Ollama, OpenRouter, Together, Groq, OpenAI, etc.)
             import urllib.request
