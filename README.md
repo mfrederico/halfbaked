@@ -2,6 +2,8 @@
 
 Codebase-aware code generation CLI + **Distillery** — train specialist GGUF models from any codebase.
 
+![HalfBaked Web UI](screenshot.png)
+
 ## Requirements
 
 - PHP 8.1+ with `curl`, `pdo_sqlite` extensions
