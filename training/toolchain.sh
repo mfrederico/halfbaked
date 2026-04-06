@@ -521,24 +521,53 @@ PARAMETER stop "<|im_start|>"
 PARAMEOF
     }
 
+    # Find GGUF files (handle varying name patterns from export.sh)
+    find_gguf() {
+        local dir="$1"
+        ls "$dir"/*.gguf 2>/dev/null | head -1
+    }
+
     # Register SFT
     SFT_GGUF_DIR="$WORK_DIR/gguf-sft"
-    SFT_GGUF_NAME="${MODEL_NAME}-sft-${QUANTIZATION}.gguf"
-    if [ -f "$SFT_GGUF_DIR/$SFT_GGUF_NAME" ]; then
+    SFT_GGUF_PATH=$(find_gguf "$SFT_GGUF_DIR")
+    if [ -n "$SFT_GGUF_PATH" ]; then
+        SFT_GGUF_NAME=$(basename "$SFT_GGUF_PATH")
         write_modelfile "$SFT_GGUF_DIR" "$SFT_GGUF_NAME"
         cd "$SFT_GGUF_DIR"
+        log "Registering ${MODEL_NAME}-sft from $SFT_GGUF_NAME..."
         ollama create "${MODEL_NAME}-sft" -f Modelfile 2>&1 | tee -a "$LOG_FILE"
         log "Registered: ${MODEL_NAME}-sft"
+    else
+        log "WARNING: No GGUF found in $SFT_GGUF_DIR"
     fi
 
     # Register DPO
     DPO_GGUF_DIR="$WORK_DIR/gguf-dpo"
-    DPO_GGUF_NAME="${MODEL_NAME}-dpo-${QUANTIZATION}.gguf"
-    if [ -f "$DPO_GGUF_DIR/$DPO_GGUF_NAME" ]; then
+    DPO_GGUF_PATH=$(find_gguf "$DPO_GGUF_DIR")
+    if [ -n "$DPO_GGUF_PATH" ]; then
+        DPO_GGUF_NAME=$(basename "$DPO_GGUF_PATH")
         write_modelfile "$DPO_GGUF_DIR" "$DPO_GGUF_NAME"
         cd "$DPO_GGUF_DIR"
+        log "Registering ${MODEL_NAME}-dpo from $DPO_GGUF_NAME..."
         ollama create "${MODEL_NAME}-dpo" -f Modelfile 2>&1 | tee -a "$LOG_FILE"
         log "Registered: ${MODEL_NAME}-dpo"
+    fi
+
+    # Register primary model name (points to best available: DPO > SFT)
+    BEST_DIR="$DPO_GGUF_DIR"
+    BEST_NAME="${MODEL_NAME}-dpo"
+    if [ -z "$DPO_GGUF_PATH" ] || [ "$SFT_ONLY" = true ]; then
+        BEST_DIR="$SFT_GGUF_DIR"
+        BEST_NAME="${MODEL_NAME}-sft"
+    fi
+    BEST_GGUF=$(find_gguf "$BEST_DIR")
+    if [ -n "$BEST_GGUF" ]; then
+        BEST_GGUF_NAME=$(basename "$BEST_GGUF")
+        write_modelfile "$BEST_DIR" "$BEST_GGUF_NAME"
+        cd "$BEST_DIR"
+        log "Registering ${MODEL_NAME} (alias for $BEST_NAME)..."
+        ollama create "${MODEL_NAME}" -f Modelfile 2>&1 | tee -a "$LOG_FILE"
+        log "Registered: ${MODEL_NAME}"
     fi
 fi
 
@@ -566,13 +595,17 @@ echo "  Models available:"
 ollama list 2>/dev/null | grep "$MODEL_NAME" || echo "    (none registered)"
 echo ""
 echo "  Test with:"
-echo "    ollama run ${MODEL_NAME}-sft 'Write a hello world in PHP'"
+echo "    ollama run ${MODEL_NAME} 'Write a hello world in PHP'"
+echo ""
+echo "  All variants:"
+echo "    ollama run ${MODEL_NAME}      # Best available (DPO > SFT)"
+echo "    ollama run ${MODEL_NAME}-sft  # SFT only"
 if [ "$SFT_ONLY" != true ]; then
-    echo "    ollama run ${MODEL_NAME}-dpo 'Write a hello world in PHP'"
+    echo "    ollama run ${MODEL_NAME}-dpo  # SFT + DPO"
 fi
 echo ""
 echo "  Use with Claude Code:"
-echo "    claude --model ollama:${MODEL_NAME}-dpo"
+echo "    claude --model ollama:${MODEL_NAME}"
 echo ""
 echo "  Resume from any stage:"
 echo "    ./training/toolchain.sh --name $MODEL_NAME --resume <stage>"
