@@ -12,6 +12,7 @@ enum ExpertStatus: string
     case Extracting = 'extracting';
     case Distilling = 'distilling';
     case Training = 'training';
+    case SelfDistilling = 'self_distilling';
     case Exporting = 'exporting';
     case Ready = 'ready';
     case Failed = 'failed';
@@ -30,6 +31,7 @@ enum ExpertStatus: string
             self::Extracting => 'Extracting Code',
             self::Distilling => 'Generating Dataset',
             self::Training => 'Training Model',
+            self::SelfDistilling => 'Self-Distilling',
             self::Exporting => 'Exporting GGUF',
             self::Ready => 'Ready',
             self::Failed => 'Failed',
@@ -42,7 +44,7 @@ enum ExpertStatus: string
             self::Pending => 'secondary',
             self::Cloning, self::Detecting, self::Extracting, self::Exporting => 'info',
             self::Distilling => 'primary',
-            self::Training => 'warning',
+            self::Training, self::SelfDistilling => 'warning',
             self::Ready => 'success',
             self::Failed => 'danger',
         };

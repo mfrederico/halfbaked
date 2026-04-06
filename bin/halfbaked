@@ -1006,6 +1006,7 @@ function distillRun(\HalfBaked\Distillery\ExpertRegistry $registry, array $posit
         ['name' => 'extract-code',       'class' => \HalfBaked\Distillery\Steps\ExtractCodeStep::class,       'status' => \HalfBaked\Distillery\ExpertStatus::Extracting],
         ['name' => 'generate-dataset',   'class' => \HalfBaked\Distillery\Steps\GenerateDatasetStep::class,   'status' => \HalfBaked\Distillery\ExpertStatus::Distilling],
         ['name' => 'train-model',        'class' => \HalfBaked\Distillery\Steps\TrainModelStep::class,        'status' => \HalfBaked\Distillery\ExpertStatus::Training],
+        ['name' => 'self-distill',       'class' => \HalfBaked\Distillery\Steps\SelfDistillStep::class,       'status' => \HalfBaked\Distillery\ExpertStatus::SelfDistilling],
         ['name' => 'export-gguf',        'class' => \HalfBaked\Distillery\Steps\ExportGgufStep::class,        'status' => \HalfBaked\Distillery\ExpertStatus::Exporting],
     ];
 
@@ -1017,6 +1018,12 @@ function distillRun(\HalfBaked\Distillery\ExpertRegistry $registry, array $posit
 
     // Multi-source support: sources array from config, fallback to single source
     $sources = $config['sources'] ?? [$source];
+
+    // SSD (Simple Self-Distillation) config — enabled via --ssd flag or config
+    $ssdEnabled = isset($flags['ssd']) || !empty($config['ssd']);
+    $ssdTemperature = (float)($flags['ssd-temperature'] ?? $config['ssd_temperature'] ?? 1.5);
+    $ssdRounds = (int)($flags['ssd-rounds'] ?? $config['ssd_rounds'] ?? 1);
+    $ssdMaxPrompts = (int)($flags['ssd-max-prompts'] ?? $config['ssd_max_prompts'] ?? 500);
 
     $data = [
         'source' => $source,
@@ -1031,6 +1038,10 @@ function distillRun(\HalfBaked\Distillery\ExpertRegistry $registry, array $posit
         'distill_model' => $distillModel,
         'api_base' => $apiBase,
         'openai_api_key' => $openaiApiKey,
+        'ssd_enabled' => $ssdEnabled,
+        'ssd_temperature' => $ssdTemperature,
+        'ssd_rounds' => $ssdRounds,
+        'ssd_max_prompts' => $ssdMaxPrompts,
     ];
 
     // Snapshot the full distillation config for reproducibility
@@ -1119,6 +1130,7 @@ function distillRun(\HalfBaked\Distillery\ExpertRegistry $registry, array $posit
             'extract-code' => ['repo_path'],
             'generate-dataset' => ['samples_file'],
             'train-model' => ['dataset_file'],
+            'self-distill' => ['dataset_file'],
             'export-gguf' => ['dataset_file'],
         ];
         foreach ($requiredArtifacts[$fromStep] ?? [] as $key) {
@@ -1357,6 +1369,12 @@ Create flags:
   --language=<lang>     Language override (php, python, javascript, css)
   --model-size=<size>   Base model size: 0.5b, 1.5b, 3b, 7b (default: 7b)
   --target=<N>          Target training examples (default: 1000)
+
+Self-Distillation (SSD) flags:
+  --ssd                     Enable Simple Self-Distillation after training
+  --ssd-temperature=<T>     Sampling temperature (default: 1.5, range: 1.2-2.0)
+  --ssd-rounds=<N>          SSD rounds (default: 1)
+  --ssd-max-prompts=<N>     Max prompts for generation (default: 500)
 
 Serve flags:
   --host=<host>         Bind address (default: 127.0.0.1)

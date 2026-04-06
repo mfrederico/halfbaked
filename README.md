@@ -63,7 +63,7 @@ The distillery auto-detects the venv at `training/.venv/bin/python3`. You can ov
 
 Train specialist LLM models from any codebase. Give it a GitHub repo or local path, and it produces a fine-tuned GGUF model registered in Ollama.
 
-**Pipeline**: Clone → Detect Language → Extract Code Samples → Generate Training Dataset (via Claude API) → QLoRA Fine-tune → Export GGUF → Register in Ollama
+**Pipeline**: Clone → Detect Language → Extract Code Samples → Generate Training Dataset (via Claude API) → QLoRA Fine-tune → Self-Distill (optional) → Export GGUF → Register in Ollama
 
 ### Quick Start (Web UI)
 
@@ -108,6 +108,30 @@ The distillery supports multiple LLM providers for generating training data:
 - **OpenAI-compatible** — Works with Ollama, OpenRouter, Together, Groq, OpenAI
 
 Configure via Settings in the web UI, or pass flags to the CLI.
+
+### Simple Self-Distillation (SSD)
+
+After SFT+DPO training, you can optionally run a self-distillation pass that improves code generation quality at zero API cost. The model generates solutions at elevated temperature, then re-trains on its own outputs. This reshapes the token distribution — sharpening high-confidence positions while preserving diversity where multiple valid continuations exist.
+
+Based on ["Embarrassingly Simple Self-Distillation Improves Code Generation" (Zhang et al., 2025)](https://arxiv.org/abs/2604.01193).
+
+```bash
+# Enable SSD during distillation
+php bin/halfbaked distill create https://github.com/user/project --name=my-expert --ssd
+
+# With custom temperature (paper recommends 1.2-2.0)
+php bin/halfbaked distill create /path/to/project --ssd --ssd-temperature=1.8 --ssd-rounds=2
+
+# Run SSD on an existing expert (resume from self-distill step)
+php bin/halfbaked distill run <id> --from-step=self-distill --ssd
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--ssd` | off | Enable self-distillation after training |
+| `--ssd-temperature` | 1.5 | Sampling temperature (higher = more reshaping) |
+| `--ssd-rounds` | 1 | Number of generate-then-train cycles |
+| `--ssd-max-prompts` | 500 | Prompts sampled from the training set |
 
 ### Importing Existing Models
 

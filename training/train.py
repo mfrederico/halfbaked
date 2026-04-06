@@ -29,6 +29,8 @@ MODELS = {
     "7b-tools": "unsloth/Qwen2.5-7B-Instruct",
     "9b": "unsloth/Qwen3.5-9B",
     "14b": "unsloth/Qwen2.5-Coder-14B-Instruct",
+    "lfm2-tool": "LiquidAI/LFM2-1.2B-Tool",
+    "lfm2": "LiquidAI/LFM2-1.2B",
 }
 
 
@@ -138,6 +140,11 @@ def main():
     parser.add_argument("--no-packing", action="store_true", help="Disable sequence packing (saves VRAM for large models)")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--sft-only", action="store_true", help="Skip DPO even if --dpo-dataset is provided")
+    parser.add_argument("--ssd", action="store_true", help="Run Simple Self-Distillation after SFT+DPO (paper: arxiv.org/abs/2604.01193)")
+    parser.add_argument("--ssd-temperature", type=float, default=1.5, help="SSD sampling temperature (default: 1.5, paper recommends 1.2-2.0)")
+    parser.add_argument("--ssd-rounds", type=int, default=1, help="SSD rounds (default: 1, diminishing returns after 2)")
+    parser.add_argument("--ssd-max-prompts", type=int, default=500, help="Max prompts for SSD generation (default: 500)")
+    parser.add_argument("--ssd-lr", type=float, default=5e-5, help="SSD learning rate (default: 5e-5)")
     args = parser.parse_args()
 
     dataset_path = Path(args.dataset)
@@ -288,20 +295,57 @@ def main():
                 tokenizer.save_pretrained(dpo_lora_path)
                 print(f"\nDPO LoRA adapter saved to: {dpo_lora_path}")
 
-    # Save final merged model (SFT+DPO if DPO ran, otherwise same as SFT)
-    print("\nMerging final model...")
+    # Save intermediate merged model (SFT+DPO, before SSD)
+    print("\nMerging intermediate model...")
     merged_path = str(output_dir / "merged_model")
     model.save_pretrained_merged(
         merged_path,
         tokenizer,
         save_method="merged_16bit",
     )
-    print(f"Final merged model saved to: {merged_path}")
+    print(f"Intermediate merged model saved to: {merged_path}")
+
+    # SSD stage (Simple Self-Distillation)
+    if args.ssd:
+        print(f"\n{'=' * 60}")
+        print(f"Stage 3: SSD (Simple Self-Distillation)")
+        print(f"  Temperature: {args.ssd_temperature}, Rounds: {args.ssd_rounds}")
+        print(f"  Paper: https://arxiv.org/abs/2604.01193")
+        print(f"{'=' * 60}")
+
+        ssd_script = str(Path(__file__).parent / "ssd.py")
+        ssd_cmd = [
+            sys.executable, ssd_script,
+            "--model", merged_path,
+            "--dataset", str(dataset_path),
+            "--output-dir", str(output_dir),
+            "--temperature", str(args.ssd_temperature),
+            "--rounds", str(args.ssd_rounds),
+            "--max-prompts", str(args.ssd_max_prompts),
+            "--lr", str(args.ssd_lr),
+            "--batch-size", str(args.batch_size),
+            "--max-seq-length", str(args.max_seq_length),
+            "--lora-rank", str(args.lora_rank),
+            "--gradient-accumulation-steps", str(args.gradient_accumulation_steps),
+        ]
+        if args.no_packing:
+            ssd_cmd.append("--no-packing")
+
+        import subprocess
+        print(f"\nLaunching SSD subprocess...")
+        result = subprocess.run(ssd_cmd, capture_output=False)
+        if result.returncode != 0:
+            print(f"\nSSD stage failed (exit {result.returncode}) — final model is SFT+DPO only")
+        else:
+            # SSD overwrites merged_model in output_dir
+            print(f"SSD complete — merged model updated at: {merged_path}")
+    else:
+        print(f"Final merged model saved to: {merged_path}")
 
     print(f"\nNext step: Run export.sh to convert to GGUF + Ollama")
-    print(f"\nTo compare SFT vs SFT+DPO, export both:")
+    print(f"\nTo compare stages, export each:")
     print(f"  ./export.sh mymodel-sft {sft_merged_path} gguf-sft/")
-    print(f"  ./export.sh mymodel-dpo {merged_path} gguf-dpo/")
+    print(f"  ./export.sh mymodel {merged_path} gguf/")
 
 
 if __name__ == "__main__":
