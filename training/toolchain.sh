@@ -136,6 +136,26 @@ if [ -z "$SOURCES" ] && [ -z "$RESUME" ]; then
     exit 1
 fi
 
+# Expand ~ and validate source paths
+if [ -n "$SOURCES" ]; then
+    EXPANDED_SOURCES=""
+    IFS=',' read -ra _SRC_CHECK <<< "$SOURCES"
+    for src in "${_SRC_CHECK[@]}"; do
+        src=$(echo "$src" | xargs)  # Trim whitespace
+        src="${src/#\~/$HOME}"       # Expand ~
+        if [ ! -d "$src" ]; then
+            echo "ERROR: Source directory not found: $src"
+            exit 1
+        fi
+        if [ -n "$EXPANDED_SOURCES" ]; then
+            EXPANDED_SOURCES="$EXPANDED_SOURCES,$src"
+        else
+            EXPANDED_SOURCES="$src"
+        fi
+    done
+    SOURCES="$EXPANDED_SOURCES"
+fi
+
 if [ ! -f "$VENV_PYTHON" ]; then
     echo "ERROR: Training venv not found. Run: ./training/setup-venv.sh"
     exit 1
