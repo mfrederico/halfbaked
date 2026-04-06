@@ -240,6 +240,43 @@
                                         <div class="fw-bold" id="est-time">~45 min distill + ~60 min train</div>
                                     </div>
                                 </div>
+                                <hr>
+                                <div class="mb-3">
+                                    <div class="form-check form-switch">
+                                        <input class="form-check-input" type="checkbox" id="ssd-enabled"
+                                               onchange="document.getElementById('ssd-options').classList.toggle('d-none', !this.checked)">
+                                        <label class="form-check-label" for="ssd-enabled">
+                                            <strong>Self-Distillation (SSD)</strong>
+                                        </label>
+                                    </div>
+                                    <div class="form-text">After training, the model re-trains on its own outputs at elevated temperature for improved code generation. Zero API cost.
+                                        <a href="https://arxiv.org/abs/2604.01193" target="_blank" class="text-info">Paper</a></div>
+                                </div>
+                                <div id="ssd-options" class="d-none">
+                                    <div class="card bg-dark border-secondary mb-3">
+                                        <div class="card-body py-2">
+                                            <div class="mb-2">
+                                                <label class="form-label small mb-1">Temperature: <strong id="ssd-temp-display">1.5</strong></label>
+                                                <input type="range" class="form-range" id="ssd-temperature"
+                                                       min="1.0" max="2.5" value="1.5" step="0.1"
+                                                       oninput="document.getElementById('ssd-temp-display').textContent=this.value">
+                                                <div class="form-text small">Higher = more diverse outputs (paper recommends 1.2-2.0)</div>
+                                            </div>
+                                            <div class="row">
+                                                <div class="col-6 mb-2">
+                                                    <label class="form-label small mb-1">Rounds</label>
+                                                    <input type="number" class="form-control form-control-sm" id="ssd-rounds"
+                                                           min="1" max="5" value="1">
+                                                </div>
+                                                <div class="col-6 mb-2">
+                                                    <label class="form-label small mb-1">Max Prompts</label>
+                                                    <input type="number" class="form-control form-control-sm" id="ssd-max-prompts"
+                                                           min="50" max="2000" value="500" step="50">
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
                             <div class="card-footer d-flex justify-content-between">
                                 <button class="btn btn-outline-secondary" onclick="wizardNext(1)">Back</button>
@@ -264,7 +301,7 @@
                                     </div>
                                     <div class="d-flex justify-content-between mt-1">
                                         <small class="text-muted">
-                                            Cloning - Detecting - Extracting - Distilling - Training - Exporting
+                                            Cloning - Detecting - Extracting - Distilling - Training - Self-Distill - Exporting
                                         </small>
                                     </div>
                                 </div>
@@ -425,6 +462,7 @@
                                     <option value="extract-code">extract-code</option>
                                     <option value="generate-dataset">generate-dataset</option>
                                     <option value="train-model">train-model</option>
+                                    <option value="self-distill">self-distill (SSD)</option>
                                     <option value="export-gguf">export-gguf</option>
                                 </select>
                             </div>
@@ -693,7 +731,7 @@
     }
 
     function statusBadge(status) {
-        var colors = { pending:'secondary', cloning:'info', detecting:'info', extracting:'info', distilling:'primary', training:'warning', exporting:'info', ready:'success', failed:'danger' };
+        var colors = { pending:'secondary', cloning:'info', detecting:'info', extracting:'info', distilling:'primary', training:'warning', self_distilling:'warning', exporting:'info', ready:'success', failed:'danger' };
         return '<span class="badge bg-' + (colors[status] || 'secondary') + '">' + esc(status) + '</span>';
     }
 
@@ -831,7 +869,7 @@
             document.getElementById('detail-loss').textContent = e.training_loss > 0 ? Number(e.training_loss).toFixed(4) : '-';
 
             // Overall step progress
-            var stepOrder = ['pending','cloning','detecting','extracting','distilling','training','exporting','ready'];
+            var stepOrder = ['pending','cloning','detecting','extracting','distilling','training','self_distilling','exporting','ready'];
             var stepIdx = stepOrder.indexOf(e.status);
             var pct = Math.min(100, Math.round((stepIdx / (stepOrder.length - 1)) * 100));
             document.getElementById('detail-progress-bar').style.width = pct + '%';
@@ -1024,6 +1062,12 @@
         try {
             var payload = { sources: sources, name: name, language: language, model_size: selectedModelSize, target_samples: targetSamples };
             if (customBaseModel) payload.base_model = customBaseModel;
+            if (document.getElementById('ssd-enabled').checked) {
+                payload.ssd_enabled = true;
+                payload.ssd_temperature = parseFloat(document.getElementById('ssd-temperature').value);
+                payload.ssd_rounds = parseInt(document.getElementById('ssd-rounds').value);
+                payload.ssd_max_prompts = parseInt(document.getElementById('ssd-max-prompts').value);
+            }
             var res = await fetch('/api/experts', { method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload) });
             var data = await res.json();
@@ -1056,7 +1100,7 @@
                 var p = progressData.progress || {};
                 if (!e) return;
 
-                var stepOrder = ['pending','cloning','detecting','extracting','distilling','training','exporting','ready'];
+                var stepOrder = ['pending','cloning','detecting','extracting','distilling','training','self_distilling','exporting','ready'];
                 var stepIdx = stepOrder.indexOf(e.status);
                 var pct = Math.min(100, Math.round((stepIdx / (stepOrder.length - 1)) * 100));
                 document.getElementById('progress-bar').style.width = pct + '%';
@@ -1093,6 +1137,14 @@
                         else document.getElementById('metric-eta').textContent = Math.round(remaining / 3600) + 'h ' + Math.round((remaining % 3600) / 60) + 'm';
                     }
                     lastBatchCount = p.batch_current;
+                } else if (e.status === 'self_distilling' && p.ssd_total > 0) {
+                    subWrap.classList.remove('d-none');
+                    var ssdPct = Math.round((p.ssd_current / p.ssd_total) * 100);
+                    subBar.style.width = ssdPct + '%';
+                    subBar.className = 'progress-bar bg-info';
+                    subPct.textContent = ssdPct + '%';
+                    var roundLabel = p.ssd_total_rounds > 1 ? ' (round ' + (p.ssd_round || 1) + '/' + p.ssd_total_rounds + ')' : '';
+                    subLabel.textContent = 'SSD: ' + p.ssd_current + '/' + p.ssd_total + ' prompts, ' + (p.ssd_valid || 0) + ' valid' + roundLabel;
                 } else if (e.status === 'training' && p.current_epoch) {
                     subWrap.classList.remove('d-none');
                     var epochs = parseInt(e.config?.epochs || 3);
@@ -1160,7 +1212,7 @@
     }
 
     function statusLabel(status) {
-        var labels = { pending:'Pending', cloning:'Cloning Repository', detecting:'Detecting Language', extracting:'Extracting Code', distilling:'Generating Dataset', training:'Training Model', exporting:'Exporting GGUF', ready:'Ready', failed:'Failed' };
+        var labels = { pending:'Pending', cloning:'Cloning Repository', detecting:'Detecting Language', extracting:'Extracting Code', distilling:'Generating Dataset', training:'Training Model', self_distilling:'Self-Distilling', exporting:'Exporting GGUF', ready:'Ready', failed:'Failed' };
         return labels[status] || status;
     }
 

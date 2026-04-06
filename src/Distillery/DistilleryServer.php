@@ -200,6 +200,14 @@ function routeApi(string $uri, string $method, \HalfBaked\Distillery\ExpertRegis
             'created_at' => date('Y-m-d H:i:s'),
         ];
 
+        // SSD (Simple Self-Distillation) settings
+        if (!empty($body['ssd_enabled'])) {
+            $config['ssd'] = true;
+            $config['ssd_temperature'] = (float)($body['ssd_temperature'] ?? 1.5);
+            $config['ssd_rounds'] = (int)($body['ssd_rounds'] ?? 1);
+            $config['ssd_max_prompts'] = (int)($body['ssd_max_prompts'] ?? 500);
+        }
+
         $id = $registry->create($name, $source, $sourceType, $config);
         $registry->update($id, ['model_size' => $modelSize]);
 
@@ -270,6 +278,7 @@ function routeApi(string $uri, string $method, \HalfBaked\Distillery\ExpertRegis
             $statusToLog = [
                 'distilling' => $expertDir . '/distill.log',
                 'training' => $expertDir . '/train.log',
+                'self_distilling' => $expertDir . '/ssd.log',
                 'exporting' => $expertDir . '/export.log',
             ];
             if (isset($statusToLog[$status])) {
@@ -492,6 +501,30 @@ function routeApi(string $uri, string $method, \HalfBaked\Distillery\ExpertRegis
             }
         }
 
+        // Parse SSD progress from ssd log
+        $ssdLog = $expertDir . '/ssd.log';
+        if (file_exists($ssdLog) && $expert['status'] === 'self_distilling') {
+            $content = file_get_contents($ssdLog);
+            // Match SSD generation progress: "SSD generation: 50/500 | 48 valid | 2.3 prompts/s"
+            if (preg_match_all('/SSD generation: (\d+)\/(\d+)\s*\|\s*(\d+) valid/', $content, $ssdMatches, PREG_SET_ORDER)) {
+                $last = end($ssdMatches);
+                $progress['ssd_current'] = (int) $last[1];
+                $progress['ssd_total'] = (int) $last[2];
+                $progress['ssd_valid'] = (int) $last[3];
+            }
+            // Match SSD SFT training progress
+            if (preg_match_all("/\\{'loss': ([\\d.]+).*?'epoch': ([\\d.]+)/", $content, $trainMatches, PREG_SET_ORDER)) {
+                $last = end($trainMatches);
+                $progress['current_loss'] = (float) $last[1];
+                $progress['current_epoch'] = (float) $last[2];
+            }
+            // Match round info
+            if (preg_match('/SSD Round (\d+)\/(\d+)/', $content, $roundMatch)) {
+                $progress['ssd_round'] = (int) $roundMatch[1];
+                $progress['ssd_total_rounds'] = (int) $roundMatch[2];
+            }
+        }
+
         echo json_encode(['progress' => $progress]);
         return;
     }
@@ -515,7 +548,7 @@ function routeApi(string $uri, string $method, \HalfBaked\Distillery\ExpertRegis
         $baseModel = $body['base_model'] ?? '';
         $modelSize = $body['model_size'] ?? '';
 
-        $validSteps = ['clone-repo', 'detect-language', 'extract-code', 'generate-dataset', 'train-model', 'export-gguf'];
+        $validSteps = ['clone-repo', 'detect-language', 'extract-code', 'generate-dataset', 'train-model', 'self-distill', 'export-gguf'];
         if ($fromStep && !in_array($fromStep, $validSteps, true)) {
             http_response_code(400);
             echo json_encode(['error' => 'Invalid step: ' . $fromStep, 'valid_steps' => $validSteps]);
@@ -684,10 +717,12 @@ function launchDistillation(string $expertId, string $fromStep = '', string $bas
     $dataDir = getenv('HALFBAKED_DATA_DIR') ?: ($root . '/data');
     $halfbakedBin = $root . '/bin/halfbaked';
 
-    // Load API key from settings
+    // Load API key and expert config from settings
     $dbPath = getenv('HALFBAKED_DB') ?: ($dataDir . '/experts.db');
     $reg = new \HalfBaked\Distillery\ExpertRegistry($dbPath);
     $apiKey = $reg->getSetting('anthropic_api_key', getenv('ANTHROPIC_API_KEY') ?: '');
+    $expert = $reg->get($expertId);
+    $config = $expert['config'] ?? [];
 
     $logDir = $dataDir . '/experts/' . $expertId;
     if (!is_dir($logDir)) { mkdir($logDir, 0755, true); }
@@ -709,6 +744,20 @@ function launchDistillation(string $expertId, string $fromStep = '', string $bas
     }
     if ($baseModel) {
         $extraFlags .= ' --base-model=' . escapeshellarg($baseModel);
+    }
+
+    // SSD flags from expert config
+    if (!empty($config['ssd'])) {
+        $extraFlags .= ' --ssd';
+        if (!empty($config['ssd_temperature'])) {
+            $extraFlags .= ' --ssd-temperature=' . escapeshellarg((string)$config['ssd_temperature']);
+        }
+        if (!empty($config['ssd_rounds'])) {
+            $extraFlags .= ' --ssd-rounds=' . escapeshellarg((string)$config['ssd_rounds']);
+        }
+        if (!empty($config['ssd_max_prompts'])) {
+            $extraFlags .= ' --ssd-max-prompts=' . escapeshellarg((string)$config['ssd_max_prompts']);
+        }
     }
 
     $cmd = sprintf(
