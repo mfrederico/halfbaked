@@ -273,6 +273,9 @@ def main():
     parser.add_argument("--system-prompt", default="You are a helpful coding assistant. You write clean, efficient, production-ready code.",
                         help="System prompt for training format")
     parser.add_argument("--dry-run", action="store_true", help="Show prompt only")
+    parser.add_argument("--workers", type=int, default=1, help="Parallel API workers (default: 1, recommended: 5-10)")
+    parser.add_argument("--pool", help="Training pool DB path")
+    parser.add_argument("--pool-source", default="", help="Source tag for pool")
     args = parser.parse_args()
 
     api_key = args.api_key or os.environ.get("ANTHROPIC_API_KEY")
@@ -299,33 +302,88 @@ def main():
     total = 0
     batches = (args.count + args.batch_size - 1) // args.batch_size
 
-    print(f"Generating {args.count} tool-use examples ({batches} API calls)")
+    workers = args.workers
+
+    pool = None
+    if args.pool:
+        sys.path.insert(0, os.path.dirname(__file__))
+        from pool import TrainingPool
+        pool = TrainingPool(args.pool)
+
+    print(f"Generating {args.count} tool-use examples ({batches} API calls, {workers} workers)")
     print(f"Model: {args.model}")
     print(f"Output: {args.output}")
 
-    with open(args.output, "w") as f:
-        for i in range(batches):
-            if total >= args.count:
-                break
+    import threading
+    lock = threading.Lock()
 
-            print(f"\rBatch {i + 1}/{batches} | {total} examples", end="", flush=True)
+    def process_one(batch_idx):
+        try:
+            conversations = generate_batch(client, args.model, args.batch_size)
+            results = []
+            for conv in conversations:
+                formatted = format_conversation(conv, args.system_prompt)
+                if formatted and len(formatted["messages"]) >= 5:
+                    results.append(formatted)
+            return batch_idx, results, None
+        except Exception as e:
+            return batch_idx, [], e
 
-            try:
-                conversations = generate_batch(client, args.model, args.batch_size)
+    if workers > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-                for conv in conversations:
-                    formatted = format_conversation(conv, args.system_prompt)
-                    if formatted and len(formatted["messages"]) >= 5:  # At least: system, user, tool_call, tool_response, final
-                        f.write(json.dumps(formatted) + "\n")
-                        total += 1
+        with open(args.output, "w") as f:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(process_one, i): i for i in range(batches)}
+                completed = 0
 
-                f.flush()
-                time.sleep(0.5)
+                for future in as_completed(futures):
+                    batch_idx, results, error = future.result()
+                    completed += 1
 
-            except Exception as e:
-                print(f"\nError on batch {i + 1}: {e}")
-                time.sleep(2)
-                continue
+                    if error:
+                        print(f"\nError on batch {batch_idx + 1}: {error}")
+                        continue
+
+                    with lock:
+                        for formatted in results:
+                            if total >= args.count:
+                                break
+                            f.write(json.dumps(formatted) + "\n")
+                            total += 1
+                            if pool:
+                                pool.add(formatted["messages"], source=args.pool_source,
+                                         category="tool_use", distill_model=args.model)
+                        f.flush()
+
+                    print(f"\rBatch {completed}/{batches} | {total} examples", end="", flush=True)
+    else:
+        with open(args.output, "w") as f:
+            for i in range(batches):
+                if total >= args.count:
+                    break
+
+                print(f"\rBatch {i + 1}/{batches} | {total} examples", end="", flush=True)
+
+                try:
+                    conversations = generate_batch(client, args.model, args.batch_size)
+
+                    for conv in conversations:
+                        formatted = format_conversation(conv, args.system_prompt)
+                        if formatted and len(formatted["messages"]) >= 5:
+                            f.write(json.dumps(formatted) + "\n")
+                            total += 1
+                            if pool:
+                                pool.add(formatted["messages"], source=args.pool_source,
+                                         category="tool_use", distill_model=args.model)
+
+                    f.flush()
+                    time.sleep(0.5)
+
+                except Exception as e:
+                    print(f"\nError on batch {i + 1}: {e}")
+                    time.sleep(2)
+                    continue
 
     print(f"\n\nDone! Generated {total} tool-use training examples")
     print(f"Output: {args.output}")

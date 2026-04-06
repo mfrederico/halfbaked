@@ -391,6 +391,9 @@ def main():
     parser.add_argument("--system-prompt", help="System prompt for generation")
     parser.add_argument("--resume", action="store_true", help="Resume from last run")
     parser.add_argument("--dry-run", action="store_true", help="Preview prompts only")
+    parser.add_argument("--workers", type=int, default=1, help="Parallel API workers (default: 1, recommended: 5-10)")
+    parser.add_argument("--pool", help="Training pool DB path — save examples to pool for accumulation across runs")
+    parser.add_argument("--pool-source", default="", help="Source tag for pool entries (e.g., myctobot)")
     args = parser.parse_args()
 
     if args.config:
@@ -502,58 +505,160 @@ def main():
                 data = json.loads(resp.read())
             return data["choices"][0]["message"]["content"]
 
-    print(f"Provider: {provider} | Model: {model_name}" + (f" | Base: {api_base}" if provider == "openai" else ""))
+    workers = args.workers
+    print(f"Provider: {provider} | Model: {model_name} | Workers: {workers}" + (f" | Base: {api_base}" if provider == "openai" else ""))
+
+    # Initialize training pool if requested
+    pool = None
+    if args.pool:
+        from pool import TrainingPool
+        pool = TrainingPool(args.pool)
+        existing = pool.count(source=args.pool_source) if args.pool_source else pool.count()
+        print(f"Training pool: {existing} existing examples")
 
     mode = "a" if args.resume and os.path.exists(output_file) else "w"
     total_pairs = progress["pairs_generated"]
 
-    with open(output_file, mode) as f:
-        for i, step in enumerate(plan[start_batch:], start=start_batch):
-            if total_pairs >= target_examples:
-                print(f"\nReached target of {target_examples} pairs!")
-                break
+    import threading
+    lock = threading.Lock()
 
-            print(
-                f"\rBatch {i + 1}/{len(plan)} | {step['category']:20s} | {total_pairs} pairs",
-                end="", flush=True,
-            )
+    def process_batch(batch_info):
+        """Process a single batch — called from thread pool."""
+        i, step = batch_info
+        try:
+            text = call_llm(system_prompt, step["prompt"])
+            pairs = parse_response(text)
+            results = []
 
-            try:
-                text = call_llm(system_prompt, step["prompt"])
+            for pair in pairs:
+                if step.get("type") == "tool_call":
+                    training_example = format_tool_conversation(
+                        pair, training_system_prompt
+                    )
+                    if training_example is None:
+                        continue
+                    category = "tool_use"
+                else:
+                    training_example = format_for_training(
+                        pair["instruction"], pair["response"], training_system_prompt
+                    )
+                    category = step.get("category", "code")
+                results.append((training_example, category))
 
-                pairs = parse_response(text)
+            return i, step, results, None
+        except Exception as e:
+            return i, step, [], e
 
-                for pair in pairs:
-                    if step.get("type") == "tool_call":
-                        # Tool-calling format: multi-turn with tool_call/tool_response
-                        training_example = format_tool_conversation(
-                            pair, training_system_prompt
-                        )
-                        if training_example is None:
-                            continue
-                    else:
-                        training_example = format_for_training(
-                            pair["instruction"], pair["response"], training_system_prompt
-                        )
-                    f.write(json.dumps(training_example) + "\n")
-                    total_pairs += 1
+    remaining_plan = plan[start_batch:]
+    batch_infos = [(start_batch + idx, step) for idx, step in enumerate(remaining_plan)]
 
-                f.flush()
+    if workers > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-                progress = {
-                    "completed": i + 1,
-                    "pairs_generated": total_pairs,
-                    "batch_index": i + 1,
-                }
-                save_progress(progress_file, progress)
+        with open(output_file, mode) as f:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {}
+                submitted = 0
+                completed_count = 0
 
-                time.sleep(0.5)
+                # Submit initial batch of work
+                for batch_info in batch_infos:
+                    if total_pairs >= target_examples:
+                        break
+                    futures[executor.submit(process_batch, batch_info)] = batch_info
+                    submitted += 1
 
-            except Exception as e:
-                print(f"\nError on batch {i + 1}: {e}")
-                save_progress(progress_file, progress)
-                time.sleep(2)
-                continue
+                for future in as_completed(futures):
+                    i, step, results, error = future.result()
+                    completed_count += 1
+
+                    if error:
+                        print(f"\nError on batch {i + 1}: {error}")
+                        continue
+
+                    with lock:
+                        for training_example, category in results:
+                            if total_pairs >= target_examples:
+                                break
+                            f.write(json.dumps(training_example) + "\n")
+                            total_pairs += 1
+
+                            if pool:
+                                pool.add(
+                                    training_example["messages"],
+                                    source=args.pool_source,
+                                    category=category,
+                                    distill_model=model_name,
+                                )
+
+                        f.flush()
+                        progress = {
+                            "completed": completed_count + start_batch,
+                            "pairs_generated": total_pairs,
+                            "batch_index": completed_count + start_batch,
+                        }
+                        save_progress(progress_file, progress)
+
+                    print(
+                        f"\rBatch {completed_count}/{len(remaining_plan)} | {step['category']:20s} | {total_pairs} pairs",
+                        end="", flush=True,
+                    )
+    else:
+        # Sequential mode (original behavior)
+        with open(output_file, mode) as f:
+            for i, step in enumerate(plan[start_batch:], start=start_batch):
+                if total_pairs >= target_examples:
+                    print(f"\nReached target of {target_examples} pairs!")
+                    break
+
+                print(
+                    f"\rBatch {i + 1}/{len(plan)} | {step['category']:20s} | {total_pairs} pairs",
+                    end="", flush=True,
+                )
+
+                try:
+                    text = call_llm(system_prompt, step["prompt"])
+                    pairs = parse_response(text)
+
+                    for pair in pairs:
+                        if step.get("type") == "tool_call":
+                            training_example = format_tool_conversation(
+                                pair, training_system_prompt
+                            )
+                            if training_example is None:
+                                continue
+                            category = "tool_use"
+                        else:
+                            training_example = format_for_training(
+                                pair["instruction"], pair["response"], training_system_prompt
+                            )
+                            category = step.get("category", "code")
+
+                        f.write(json.dumps(training_example) + "\n")
+                        total_pairs += 1
+
+                        if pool:
+                            pool.add(
+                                training_example["messages"],
+                                source=args.pool_source,
+                                category=category,
+                                distill_model=model_name,
+                            )
+
+                    f.flush()
+                    progress = {
+                        "completed": i + 1,
+                        "pairs_generated": total_pairs,
+                        "batch_index": i + 1,
+                    }
+                    save_progress(progress_file, progress)
+                    time.sleep(0.5)
+
+                except Exception as e:
+                    print(f"\nError on batch {i + 1}: {e}")
+                    save_progress(progress_file, progress)
+                    time.sleep(2)
+                    continue
 
     print(f"\n\nDone! Generated {total_pairs} training pairs")
     print(f"Output: {output_file}")
@@ -562,6 +667,10 @@ def main():
         with open(output_file) as f:
             count = sum(1 for _ in f)
         print(f"Total examples in file: {count}")
+
+    if pool:
+        s = pool.stats()
+        print(f"Training pool: {s['total']} total ({s['tool_use_examples']} tool-use, {s['code_examples']} code)")
 
 
 if __name__ == "__main__":

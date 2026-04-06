@@ -56,6 +56,7 @@ SYSTEM_PROMPT=""
 DPO_CANDIDATES=3
 DISTILL_MODEL="claude-sonnet-4-20250514"
 TOOL_DATA_COUNT=0
+WORKERS=8
 
 # ─── Parse arguments ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -79,6 +80,7 @@ while [[ $# -gt 0 ]]; do
         --dpo-candidates) DPO_CANDIDATES="$2"; shift 2 ;;
         --distill-model)  DISTILL_MODEL="$2"; shift 2 ;;
         --tool-data)      TOOL_DATA_COUNT="$2"; shift 2 ;;
+        --workers)        WORKERS="$2"; shift 2 ;;
         -h|--help)
             echo "HalfBaked Training Toolchain"
             echo ""
@@ -107,6 +109,7 @@ while [[ $# -gt 0 ]]; do
             echo "                          Use claude-haiku-4-5-20251001 for cheaper/faster generation"
             echo "  --tool-data <n>         Extra tool-use examples via generate_tool_data.py (default: 0)"
             echo "                          Recommended: 20-30% of --target (e.g., --target 5000 --tool-data 1000)"
+            echo "  --workers <n>           Parallel API workers for generation (default: 8)"
             echo ""
             echo "Other:"
             echo "  --resume <stage>        Resume from: extract, distill, train, harvest, dpo, export"
@@ -284,19 +287,28 @@ DISTEOF
     log "Target: $TARGET_EXAMPLES examples (${TOOL_RATIO} tool-calling ratio)"
     log "Provider: Anthropic Claude ($DISTILL_MODEL)"
 
+    POOL_DB="$PROJECT_DIR/data/training_pool.db"
+
     $VENV_PYTHON "$SCRIPT_DIR/distill.py" \
         --config "$WORK_DIR/distill_config.json" \
-        --model "$DISTILL_MODEL" 2>&1 | tee -a "$LOG_FILE"
+        --model "$DISTILL_MODEL" \
+        --workers "$WORKERS" \
+        --pool "$POOL_DB" \
+        --pool-source "$MODEL_NAME" \
+        2>&1 | tee -a "$LOG_FILE"
 
     # Generate tool-use training data if requested
     if [ "$TOOL_DATA_COUNT" -gt 0 ]; then
-        log "Generating $TOOL_DATA_COUNT tool-use training examples..."
+        log "Generating $TOOL_DATA_COUNT tool-use training examples ($WORKERS workers)..."
         TOOL_FILE="$WORK_DIR/tool_training.jsonl"
         $VENV_PYTHON "$SCRIPT_DIR/generate_tool_data.py" \
             --output "$TOOL_FILE" \
             --count "$TOOL_DATA_COUNT" \
             --batch-size 5 \
             --model "$DISTILL_MODEL" \
+            --workers "$WORKERS" \
+            --pool "$POOL_DB" \
+            --pool-source "$MODEL_NAME" \
             2>&1 | tee -a "$LOG_FILE"
 
         # Append tool data to main dataset
@@ -332,6 +344,14 @@ if should_run "train"; then
 
     DATASET_FILE="$WORK_DIR/dataset.jsonl"
     OUTPUT_DIR="$WORK_DIR/output"
+    POOL_DB="$PROJECT_DIR/data/training_pool.db"
+
+    # Export full pool to training dataset (accumulates across all runs)
+    if [ -f "$POOL_DB" ]; then
+        log "Exporting training pool to dataset..."
+        $VENV_PYTHON "$SCRIPT_DIR/pool.py" --db "$POOL_DB" export "$DATASET_FILE"
+        $VENV_PYTHON "$SCRIPT_DIR/pool.py" --db "$POOL_DB" stats 2>&1 | tee -a "$LOG_FILE"
+    fi
 
     # Unload Ollama models to free GPU
     log "Freeing GPU memory..."
