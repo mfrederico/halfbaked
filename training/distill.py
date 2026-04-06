@@ -402,7 +402,7 @@ def main():
     output_file = config.get("output_file", args.output or "dataset.jsonl")
     api_key = config.get("api_key", args.api_key or os.environ.get("ANTHROPIC_API_KEY"))
     provider = config.get("provider", args.provider)
-    model_name = config.get("model", args.model)
+    model_name = args.model or config.get("model")
     api_base = config.get("api_base", config.get("ollama_host", args.api_base))
     # Normalize: if api_base doesn't end with /v1, append it (e.g. http://localhost:11434 → http://localhost:11434/v1)
     if api_base and not api_base.rstrip("/").endswith("/v1"):

@@ -54,6 +54,8 @@ RESUME=""
 WORK_DIR=""
 SYSTEM_PROMPT=""
 DPO_CANDIDATES=3
+DISTILL_MODEL="claude-sonnet-4-20250514"
+TOOL_DATA_COUNT=0
 
 # ─── Parse arguments ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -75,6 +77,8 @@ while [[ $# -gt 0 ]]; do
         --work-dir)       WORK_DIR="$2"; shift 2 ;;
         --system-prompt)  SYSTEM_PROMPT="$2"; shift 2 ;;
         --dpo-candidates) DPO_CANDIDATES="$2"; shift 2 ;;
+        --distill-model)  DISTILL_MODEL="$2"; shift 2 ;;
+        --tool-data)      TOOL_DATA_COUNT="$2"; shift 2 ;;
         -h|--help)
             echo "HalfBaked Training Toolchain"
             echo ""
@@ -97,6 +101,12 @@ while [[ $# -gt 0 ]]; do
             echo "Export options:"
             echo "  --quantization <type>   GGUF quantization: Q4_K_M, Q5_K_M, Q8_0 (default: Q8_0)"
             echo "  --num-ctx <n>           Ollama context window (default: 32768)"
+            echo ""
+            echo "Data generation:"
+            echo "  --distill-model <model> Claude model for dataset generation (default: claude-sonnet-4-20250514)"
+            echo "                          Use claude-haiku-4-5-20251001 for cheaper/faster generation"
+            echo "  --tool-data <n>         Extra tool-use examples via generate_tool_data.py (default: 0)"
+            echo "                          Recommended: 20-30% of --target (e.g., --target 5000 --tool-data 1000)"
             echo ""
             echo "Other:"
             echo "  --resume <stage>        Resume from: extract, distill, train, harvest, dpo, export"
@@ -272,10 +282,30 @@ if should_run "distill"; then
 DISTEOF
 
     log "Target: $TARGET_EXAMPLES examples (${TOOL_RATIO} tool-calling ratio)"
-    log "Provider: Anthropic Claude"
+    log "Provider: Anthropic Claude ($DISTILL_MODEL)"
 
     $VENV_PYTHON "$SCRIPT_DIR/distill.py" \
-        --config "$WORK_DIR/distill_config.json" 2>&1 | tee -a "$LOG_FILE"
+        --config "$WORK_DIR/distill_config.json" \
+        --model "$DISTILL_MODEL" 2>&1 | tee -a "$LOG_FILE"
+
+    # Generate tool-use training data if requested
+    if [ "$TOOL_DATA_COUNT" -gt 0 ]; then
+        log "Generating $TOOL_DATA_COUNT tool-use training examples..."
+        TOOL_FILE="$WORK_DIR/tool_training.jsonl"
+        $VENV_PYTHON "$SCRIPT_DIR/generate_tool_data.py" \
+            --output "$TOOL_FILE" \
+            --count "$TOOL_DATA_COUNT" \
+            --batch-size 5 \
+            --model "$DISTILL_MODEL" \
+            2>&1 | tee -a "$LOG_FILE"
+
+        # Append tool data to main dataset
+        if [ -f "$TOOL_FILE" ]; then
+            cat "$TOOL_FILE" >> "$DATASET_FILE"
+            TOOL_COUNT=$(wc -l < "$TOOL_FILE")
+            log "Appended $TOOL_COUNT tool-use examples to dataset"
+        fi
+    fi
 
     # Clean bad JSON lines
     $VENV_PYTHON -c "
