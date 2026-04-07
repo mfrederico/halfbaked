@@ -140,6 +140,7 @@ def main():
     parser.add_argument("--no-packing", action="store_true", help="Disable sequence packing (saves VRAM for large models)")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--sft-only", action="store_true", help="Skip DPO even if --dpo-dataset is provided")
+    parser.add_argument("--resume-checkpoint", help="Resume SFT training from a checkpoint directory")
     parser.add_argument("--ssd", action="store_true", help="Run Simple Self-Distillation after SFT+DPO (paper: arxiv.org/abs/2604.01193)")
     parser.add_argument("--ssd-temperature", type=float, default=1.5, help="SSD sampling temperature (default: 1.5, paper recommends 1.2-2.0)")
     parser.add_argument("--ssd-rounds", type=int, default=1, help="SSD rounds (default: 1, diminishing returns after 2)")
@@ -253,8 +254,12 @@ def main():
     print("Stage 1: SFT (Supervised Fine-Tuning)")
     print("=" * 60)
 
-    print("\nStarting SFT training...")
-    stats = trainer.train()
+    resume_from = args.resume_checkpoint if hasattr(args, 'resume_checkpoint') else None
+    if resume_from:
+        print(f"\nResuming SFT training from {resume_from}...")
+    else:
+        print("\nStarting SFT training...")
+    stats = trainer.train(resume_from_checkpoint=resume_from)
     print(f"\nSFT training complete!")
     print(f"  Loss: {stats.training_loss:.4f}")
     print(f"  Runtime: {stats.metrics['train_runtime']:.0f}s")
