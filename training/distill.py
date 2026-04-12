@@ -300,7 +300,7 @@ def build_generation_plan(
     plan = []
 
     tool_budget = int(target * tool_call_ratio)
-    code_budget = int((target - tool_budget) * 0.45)
+    code_budget = int((target - tool_budget) * 0.60)  # 60% code-context (up from 45%)
     standalone_budget = target - code_budget - tool_budget
 
     method_samples = [s for s in samples if s["type"] in ("method", "component")]
@@ -316,21 +316,39 @@ def build_generation_plan(
         scored_methods.append((score, s))
     scored_methods.sort(key=lambda x: -x[0])
 
-    # Code-context batches
-    selected = [s for _, s in scored_methods[:code_budget // batch_size + 5]]
-    random.shuffle(selected)
+    # Score full files too — use them when methods are sparse
+    scored_files = []
+    for s in file_samples:
+        content = s.get("content", "")
+        lines = len(content.split("\n"))
+        # Prefer medium-sized files (not trivially small, not huge)
+        score = min(lines, 200) if lines >= 20 else 0
+        if score > 0:
+            scored_files.append((score, s))
+    scored_files.sort(key=lambda x: -x[0])
 
-    templates = prompt_templates.copy()
-    for i in range(0, min(len(selected), code_budget // batch_size)):
-        sample = selected[i % len(selected)]
-        template = templates[i % len(templates)]
-        code, filepath = get_code_for_sample(sample)
-        plan.append({
-            "type": "code_context",
-            "category": template["category"],
-            "prompt": template["prompt"].replace("{n}", str(batch_size)).replace("{file}", filepath).replace("{code}", code),
-            "expected_pairs": batch_size,
-        })
+    # Combine: methods first, then files as fallback
+    code_samples_pool = [s for _, s in scored_methods]
+    if len(code_samples_pool) < code_budget // batch_size:
+        # Not enough methods — supplement with full files
+        needed = (code_budget // batch_size) - len(code_samples_pool) + 10
+        code_samples_pool.extend([s for _, s in scored_files[:needed]])
+
+    # Code-context batches — cycle through all available samples with all templates
+    num_code_batches = code_budget // batch_size
+    if code_samples_pool:
+        random.shuffle(code_samples_pool)
+        templates = prompt_templates.copy()
+        for i in range(num_code_batches):
+            sample = code_samples_pool[i % len(code_samples_pool)]
+            template = templates[i % len(templates)]
+            code, filepath = get_code_for_sample(sample)
+            plan.append({
+                "type": "code_context",
+                "category": template["category"],
+                "prompt": template["prompt"].replace("{n}", str(batch_size)).replace("{file}", filepath).replace("{code}", code),
+                "expected_pairs": batch_size,
+            })
 
     # Standalone batches
     standalone_batch = 8
@@ -348,7 +366,7 @@ def build_generation_plan(
     tool_batch = 3  # Fewer per batch — tool conversations are complex
     if tool_budget > 0:
         # Code-context tool calls
-        all_samples = selected or method_samples or file_samples or samples
+        all_samples = code_samples_pool or file_samples or samples
         tool_code_count = tool_budget // 2
         for i in range(tool_code_count // tool_batch):
             if not all_samples:
@@ -440,12 +458,13 @@ def main():
     # Default templates if none provided
     if not prompt_templates:
         prompt_templates = [
-            {"category": "explain", "prompt": "Given this code, generate {n} instruction-response pairs explaining it.\n\nCode from `{file}`:\n```\n{code}\n```\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
-            {"category": "generate", "prompt": "Based on this code pattern, generate {n} instruction-response pairs asking to write similar code.\n\nCode from `{file}`:\n```\n{code}\n```\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
+            {"category": "generate", "prompt": "Study this code from a real project. Generate {n} instruction-response pairs where the instruction asks to write NEW functionality that follows the same patterns, and the response is COMPLETE working code (no placeholders).\n\nCode from `{file}`:\n```\n{code}\n```\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
+            {"category": "refactor", "prompt": "Given this code, generate {n} instruction-response pairs where the user asks to improve it. The response must be the COMPLETE improved version.\n\nCode from `{file}`:\n```\n{code}\n```\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
+            {"category": "extend", "prompt": "Given this code, generate {n} instruction-response pairs where the user asks to ADD a feature. The response must be COMPLETE working code.\n\nCode from `{file}`:\n```\n{code}\n```\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
         ]
     if not standalone_prompts:
         standalone_prompts = [
-            {"category": "knowledge", "prompt": "Generate {n} instruction-response pairs about coding best practices.\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
+            {"category": "patterns", "prompt": "Generate {n} instruction-response pairs about writing production code. Each response must be COMPLETE working code, not explanations.\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
         ]
 
     samples = load_samples(samples_file)

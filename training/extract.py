@@ -139,6 +139,13 @@ METADATA_EXTRACTORS = {
     "css": extract_css_metadata,
 }
 
+# Default function/method patterns per language
+DEFAULT_FUNCTION_PATTERNS = {
+    "php": r"(?:public|private|protected|static|\s)*\s*function\s+(\w+)\s*\(",
+    "python": r"(?:def|async\s+def)\s+(\w+)\s*\(",
+    "javascript": r"(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(|(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\(",
+}
+
 
 # --- Function/Method Extraction ---
 
@@ -422,10 +429,11 @@ def main():
                     "component": comp,
                 })
         elif metadata_extractor == "python":
-            if function_pattern:
-                methods = extract_python_functions(content, function_pattern)
+            pattern = function_pattern or DEFAULT_FUNCTION_PATTERNS.get("python", "")
+            if pattern:
+                methods = extract_python_functions(content, pattern)
             else:
-                methods = extract_python_functions(content, r"(?:def|async\s+def)\s+(\w+)\s*\(")
+                methods = []
             for method in methods:
                 if len(method["code"].split("\n")) < 3:
                     continue
@@ -435,8 +443,9 @@ def main():
                     "method": method,
                 })
         else:
-            if function_pattern:
-                methods = extract_methods_generic(content, function_pattern)
+            pattern = function_pattern or DEFAULT_FUNCTION_PATTERNS.get(metadata_extractor, "")
+            if pattern:
+                methods = extract_methods_generic(content, pattern)
             else:
                 methods = []
             for method in methods:

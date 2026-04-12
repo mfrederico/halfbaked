@@ -38,14 +38,14 @@ VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python3"
 
 MODEL_NAME=""
 SOURCES=""
-BASE_MODEL="7b-tools"
-TARGET_EXAMPLES=500
+BASE_MODEL="7b"
+TARGET_EXAMPLES=2000
 TOOL_RATIO=0.2
 BATCH_SIZE=5
 EPOCHS=3
 DPO_EPOCHS=1
-MAX_SEQ_LENGTH=1536
-LORA_RANK=32
+MAX_SEQ_LENGTH=4096
+LORA_RANK=64
 GRAD_ACCUM=8
 QUANTIZATION="Q8_0"
 NUM_CTX=32768
@@ -57,6 +57,7 @@ DPO_CANDIDATES=3
 DISTILL_MODEL="claude-sonnet-4-20250514"
 TOOL_DATA_COUNT=0
 WORKERS=8
+DISTILL_ROUNDS=1
 
 # ─── Parse arguments ─────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -81,6 +82,7 @@ while [[ $# -gt 0 ]]; do
         --distill-model)  DISTILL_MODEL="$2"; shift 2 ;;
         --tool-data)      TOOL_DATA_COUNT="$2"; shift 2 ;;
         --workers)        WORKERS="$2"; shift 2 ;;
+        --distill-rounds) DISTILL_ROUNDS="$2"; shift 2 ;;
         -h|--help)
             echo "HalfBaked Training Toolchain"
             echo ""
@@ -110,6 +112,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --tool-data <n>         Extra tool-use examples via generate_tool_data.py (default: 0)"
             echo "                          Recommended: 20-30% of --target (e.g., --target 5000 --tool-data 1000)"
             echo "  --workers <n>           Parallel API workers for generation (default: 8)"
+            echo "  --distill-rounds <n>    Run distillation N times to accumulate diverse examples (default: 1)"
             echo ""
             echo "Other:"
             echo "  --resume <stage>        Resume from: extract, distill, train, harvest, dpo, export"
@@ -182,7 +185,7 @@ mkdir -p "$WORK_DIR"
 
 # Default system prompt
 if [ -z "$SYSTEM_PROMPT" ]; then
-    SYSTEM_PROMPT="You are a helpful coding assistant. You write clean, efficient, production-ready code."
+    SYSTEM_PROMPT="You are an expert PHP coding assistant. You write complete, production-ready PHP code using FlightPHP for routing and RedBeanPHP for database operations. You use modern PHP 8.x features. You never write placeholder code or pseudocode — every response is runnable."
 fi
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -285,37 +288,56 @@ if should_run "distill"; then
     "samples_file": "$WORK_DIR/code_samples.jsonl",
     "output_file": "$DATASET_FILE",
     "api_key": "$ANTHROPIC_API_KEY",
-    "system_prompt": "You are generating training data for a specialized PHP AI coding assistant with tool-calling capabilities.\nThe assistant specializes in PHP frameworks (FlightPHP, RedBeanPHP, Swoole), modern PHP patterns, and tool usage.\nGenerate diverse, high-quality instruction-response pairs.",
+    "system_prompt": "You are generating training data for a specialized PHP AI coding assistant.\nThe assistant writes production-ready PHP using FlightPHP (routing, middleware), RedBeanPHP (ORM/database), and modern PHP 8.x patterns.\n\nCRITICAL RULES for every response you generate:\n1. Every code response MUST be complete, runnable PHP — no pseudocode, no placeholders, no '// ...' shortcuts\n2. Use RedBeanPHP (R::find, R::store, R::dispense, R::findOne, R::exec) for ALL database operations — never raw PDO or query builders\n3. Use FlightPHP (Flight::route, Flight::json, Flight::request, Flight::halt) for ALL HTTP routing — never echo or raw headers\n4. Include proper error handling with try/catch and Flight::halt() for error responses\n5. Use PHP 8.x features: named arguments, match expressions, readonly properties, enums, union types, null-safe operator\n6. Responses must be the kind of code a senior developer would merge without changes",
     "training_system_prompt": "$SYSTEM_PROMPT",
     "target_examples": $TARGET_EXAMPLES,
     "batch_size": $BATCH_SIZE,
     "prompt_templates": [
-        {"category": "explain", "prompt": "Given this PHP code from a real project, generate {n} instruction-response pairs explaining it.\n\nCode from \`{file}\`:\n\`\`\`php\n{code}\n\`\`\`\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
-        {"category": "generate", "prompt": "Based on this PHP code pattern, generate {n} instruction-response pairs asking to write similar code.\n\nCode from \`{file}\`:\n\`\`\`php\n{code}\n\`\`\`\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
-        {"category": "debug", "prompt": "Based on this PHP code, generate {n} instruction-response pairs about debugging common issues.\n\nCode from \`{file}\`:\n\`\`\`php\n{code}\n\`\`\`\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
-        {"category": "refactor", "prompt": "Based on this PHP code, generate {n} instruction-response pairs about refactoring and improvements.\n\nCode from \`{file}\`:\n\`\`\`php\n{code}\n\`\`\`\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
-        {"category": "architecture", "prompt": "Based on this PHP code, generate {n} instruction-response pairs about architecture decisions.\n\nCode from \`{file}\`:\n\`\`\`php\n{code}\n\`\`\`\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."}
+        {"category": "generate", "prompt": "Study this PHP code from a real production project. Generate {n} instruction-response pairs where the instruction asks to write NEW functionality that follows the same patterns, and the response is COMPLETE working PHP code.\n\nThe response code MUST:\n- Be fully functional (no placeholders or '...')\n- Use the same frameworks visible in the code (FlightPHP for routes, RedBeanPHP for data)\n- Include proper use/namespace statements\n- Handle errors appropriately\n\nCode from \`{file}\`:\n\`\`\`php\n{code}\n\`\`\`\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields. The response MUST be complete PHP code."},
+        {"category": "generate_variation", "prompt": "Given this PHP code, generate {n} instruction-response pairs where the user asks to build something SIMILAR but for a different domain (e.g., if the code manages users, generate code that manages products or orders using the same patterns).\n\nEach response must be COMPLETE runnable PHP code using the same framework patterns as the original.\n\nCode from \`{file}\`:\n\`\`\`php\n{code}\n\`\`\`\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
+        {"category": "refactor", "prompt": "Given this PHP code, generate {n} instruction-response pairs where the user asks to improve or refactor the code. The response should provide the COMPLETE improved version with explanations of what changed and why.\n\nFocus on: modern PHP 8.x features, better error handling, cleaner RedBeanPHP usage, proper FlightPHP middleware patterns.\n\nCode from \`{file}\`:\n\`\`\`php\n{code}\n\`\`\`\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
+        {"category": "debug", "prompt": "Given this PHP code, generate {n} instruction-response pairs about realistic bugs and how to fix them. The instruction should describe a symptom (error message, wrong behavior), and the response should diagnose the cause AND provide the COMPLETE fixed code.\n\nCode from \`{file}\`:\n\`\`\`php\n{code}\n\`\`\`\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
+        {"category": "extend", "prompt": "Given this PHP code, generate {n} instruction-response pairs where the user asks to ADD a specific feature. The response must provide COMPLETE working code that integrates with the existing patterns.\n\nExamples: add pagination, add search/filtering, add validation, add caching, add middleware, add API authentication.\n\nCode from \`{file}\`:\n\`\`\`php\n{code}\n\`\`\`\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
+        {"category": "test", "prompt": "Given this PHP code, generate {n} instruction-response pairs where the user asks to write tests. The response must provide COMPLETE PHPUnit test code that actually tests the functionality.\n\nCode from \`{file}\`:\n\`\`\`php\n{code}\n\`\`\`\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."}
     ],
     "standalone_prompts": [
-        {"category": "framework_knowledge", "prompt": "Generate {n} instruction-response pairs about PHP framework usage (FlightPHP, RedBeanPHP, Swoole).\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
-        {"category": "patterns", "prompt": "Generate {n} instruction-response pairs about PHP design patterns in production systems.\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
-        {"category": "integration", "prompt": "Generate {n} instruction-response pairs about integrating PHP systems (APIs, databases, queues, caching).\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."}
+        {"category": "flight_routes", "prompt": "Generate {n} instruction-response pairs where the user asks to build FlightPHP API endpoints. Each response must be COMPLETE working PHP code with:\n- Flight::route() definitions with proper HTTP methods\n- Request validation using Flight::request()\n- RedBeanPHP for database operations (R::find, R::store, R::dispense)\n- JSON responses via Flight::json()\n- Error handling with Flight::halt()\n\nVary the domains: user management, product catalog, order processing, inventory, notifications, file uploads, authentication.\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
+        {"category": "redbean_models", "prompt": "Generate {n} instruction-response pairs about RedBeanPHP data modeling and queries. Each response must be COMPLETE working PHP code showing:\n- R::dispense() and R::store() for creating records\n- R::find() and R::findOne() with query conditions\n- R::exec() for complex queries\n- Bean relationships (ownList, sharedList, via)\n- FUSE models with custom methods\n- Transaction handling with R::begin/commit/rollback\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
+        {"category": "middleware", "prompt": "Generate {n} instruction-response pairs about FlightPHP middleware, request/response handling, and application structure. Each response must be COMPLETE working PHP code.\n\nTopics: authentication middleware, CORS handling, rate limiting, request logging, input sanitization, JSON API patterns, error handler registration, grouping routes.\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."},
+        {"category": "php_patterns", "prompt": "Generate {n} instruction-response pairs about modern PHP 8.x patterns applied to web development. Each response must be COMPLETE working PHP code.\n\nTopics: enums for status fields, readonly DTOs, named arguments, match expressions, fibers for async, attributes for validation, union types, null-safe operators, first-class callables.\n\nReturn a JSON array of objects with \"instruction\" and \"response\" fields."}
     ]
 }
 DISTEOF
 
-    log "Target: $TARGET_EXAMPLES examples (${TOOL_RATIO} tool-calling ratio)"
+    log "Target: $TARGET_EXAMPLES examples x $DISTILL_ROUNDS rounds (${TOOL_RATIO} tool-calling ratio)"
     log "Provider: Anthropic Claude ($DISTILL_MODEL)"
 
     POOL_DB="$PROJECT_DIR/data/training_pool.db"
 
-    $VENV_PYTHON "$SCRIPT_DIR/distill.py" \
-        --config "$WORK_DIR/distill_config.json" \
-        --model "$DISTILL_MODEL" \
-        --workers "$WORKERS" \
-        --pool "$POOL_DB" \
-        --pool-source "$MODEL_NAME" \
-        2>&1 | tee -a "$LOG_FILE"
+    for ROUND in $(seq 1 "$DISTILL_ROUNDS"); do
+        log "── Distill round $ROUND/$DISTILL_ROUNDS ──"
+
+        # Clear progress file between rounds so distill.py generates fresh batches
+        rm -f "$WORK_DIR/.generate_progress.json"
+
+        # Round 1 writes fresh, subsequent rounds append
+        RESUME_FLAG=""
+        if [ "$ROUND" -gt 1 ]; then
+            RESUME_FLAG="--resume"
+        fi
+
+        $VENV_PYTHON "$SCRIPT_DIR/distill.py" \
+            --config "$WORK_DIR/distill_config.json" \
+            --model "$DISTILL_MODEL" \
+            --workers "$WORKERS" \
+            --pool "$POOL_DB" \
+            --pool-source "$MODEL_NAME" \
+            $RESUME_FLAG \
+            2>&1 | tee -a "$LOG_FILE"
+
+        ROUND_COUNT=$(wc -l < "$DATASET_FILE" 2>/dev/null || echo "0")
+        log "Round $ROUND complete: $ROUND_COUNT examples in dataset"
+    done
 
     # Generate tool-use training data if requested
     if [ "$TOOL_DATA_COUNT" -gt 0 ]; then
@@ -356,6 +378,11 @@ with open('$DATASET_FILE', 'w') as f:
         f.write(line + '\n')
 print(f'Clean dataset: {len(good)} examples')
 " 2>&1 | tee -a "$LOG_FILE"
+
+    # Show pool stats after all rounds
+    if [ -f "$POOL_DB" ]; then
+        $VENV_PYTHON "$SCRIPT_DIR/pool.py" --db "$POOL_DB" stats 2>&1 | tee -a "$LOG_FILE"
+    fi
 fi
 
 # ─── Stage 3: Train SFT ──────────────────────────────────────────────────────
@@ -398,7 +425,7 @@ if should_run "train"; then
         --max-seq-length "$MAX_SEQ_LENGTH" \
         --lora-rank "$LORA_RANK" \
         --gradient-accumulation-steps "$GRAD_ACCUM" \
-        --sft-only \
+        $SFT_FLAG \
         2>&1 | tee -a "$LOG_FILE"
 
     log "SFT training complete"
