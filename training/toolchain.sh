@@ -38,15 +38,15 @@ VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python3"
 
 MODEL_NAME=""
 SOURCES=""
-BASE_MODEL="7b"
+BASE_MODEL="3b"
 TARGET_EXAMPLES=2000
 TOOL_RATIO=0.2
 BATCH_SIZE=5
 EPOCHS=3
 DPO_EPOCHS=1
-MAX_SEQ_LENGTH=4096
-LORA_RANK=64
-GRAD_ACCUM=8
+MAX_SEQ_LENGTH=2048
+LORA_RANK=32
+GRAD_ACCUM=16
 QUANTIZATION="Q8_0"
 NUM_CTX=32768
 SFT_ONLY=false
@@ -55,6 +55,8 @@ WORK_DIR=""
 SYSTEM_PROMPT=""
 DPO_CANDIDATES=3
 DISTILL_MODEL="claude-sonnet-4-20250514"
+DISTILL_PROVIDER="anthropic"
+DISTILL_API_BASE="http://127.0.0.1:11434/v1"
 TOOL_DATA_COUNT=0
 WORKERS=8
 DISTILL_ROUNDS=1
@@ -80,6 +82,8 @@ while [[ $# -gt 0 ]]; do
         --system-prompt)  SYSTEM_PROMPT="$2"; shift 2 ;;
         --dpo-candidates) DPO_CANDIDATES="$2"; shift 2 ;;
         --distill-model)  DISTILL_MODEL="$2"; shift 2 ;;
+        --distill-provider) DISTILL_PROVIDER="$2"; shift 2 ;;
+        --distill-api-base) DISTILL_API_BASE="$2"; shift 2 ;;
         --tool-data)      TOOL_DATA_COUNT="$2"; shift 2 ;;
         --workers)        WORKERS="$2"; shift 2 ;;
         --distill-rounds) DISTILL_ROUNDS="$2"; shift 2 ;;
@@ -326,9 +330,15 @@ DISTEOF
             RESUME_FLAG="--resume"
         fi
 
+        PROVIDER_FLAGS="--provider $DISTILL_PROVIDER"
+        if [ "$DISTILL_PROVIDER" != "anthropic" ]; then
+            PROVIDER_FLAGS="$PROVIDER_FLAGS --api-base $DISTILL_API_BASE"
+        fi
+
         $VENV_PYTHON "$SCRIPT_DIR/distill.py" \
             --config "$WORK_DIR/distill_config.json" \
             --model "$DISTILL_MODEL" \
+            $PROVIDER_FLAGS \
             --workers "$WORKERS" \
             --pool "$POOL_DB" \
             --pool-source "$MODEL_NAME" \
@@ -415,6 +425,7 @@ if should_run "train"; then
         SFT_FLAG="--sft-only"
     fi
 
+    set -o pipefail
     $VENV_PYTHON "$SCRIPT_DIR/train.py" \
         --dataset "$DATASET_FILE" \
         --output-dir "$OUTPUT_DIR" \
@@ -427,6 +438,11 @@ if should_run "train"; then
         --gradient-accumulation-steps "$GRAD_ACCUM" \
         $SFT_FLAG \
         2>&1 | tee -a "$LOG_FILE"
+
+    if [ ! -d "$OUTPUT_DIR/merged_model_sft" ]; then
+        log "ERROR: Training failed — no merged model produced. Stopping."
+        exit 1
+    fi
 
     log "SFT training complete"
 fi
